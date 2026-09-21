@@ -1,0 +1,137 @@
+# CS452 Assignment 0 - Polling Train Controller
+
+## Repository
+
+GitLab repository:
+
+https://git.uwaterloo.ca/y68wu/cs452.git
+
+Tested implementation commit:
+
+ad12a1ac7c42f8239ad62090ef76fa07d3b1903d
+
+## Build Instructions
+
+Build on `linux.student.cs.uwaterloo.ca` from the repository root:
+
+    make clean
+    make
+
+The build produces:
+
+    a0.elf
+    a0.img
+
+The file uploaded to the Raspberry Pi is:
+
+    a0.img
+
+## Upload Instructions
+
+The CS452 upload script can be used after storing the CS452 API token in:
+
+    $HOME/.cs452_token
+
+Example upload command for Track C:
+
+    /u/cs452/public/tools/upload.sh ./a0.img trackc
+
+Example upload command for Track D:
+
+    /u/cs452/public/tools/upload.sh ./a0.img trackd
+
+After uploading, reset the corresponding Raspberry Pi so that it downloads and boots the new image.
+
+## Tested Hardware Setup
+
+The submitted program was tested on:
+
+    Track: Track C
+    Raspberry Pi MAC: d8:3a:dd:1b:38:6c
+    Train tested: 14
+    Switch tested: 1
+
+## Program Overview
+
+This program is a polling-based train controller for CS452 Assignment 0. It does not use interrupts.
+
+The main polling loop repeatedly:
+
+1. Reads the Raspberry Pi system timer.
+2. Reads terminal input using non-blocking UART.
+3. Parses user commands.
+4. Queues and sends CAN frames through the MCP2515 CAN controller.
+5. Updates terminal output.
+6. Handles delayed reverse commands.
+
+The clock is computed from the Raspberry Pi system timer rather than by counting polling-loop iterations.
+
+## Supported Commands
+
+### Train speed
+
+    tr <train> <speed>
+
+Example:
+
+    tr 14 5
+
+This sets train 14 to speed 5.
+
+Speed 0 stops the train:
+
+    tr 14 0
+
+### Reverse train
+
+    rv <train>
+
+Example:
+
+    rv 14
+
+The implementation queues a stop command, waits for a delay, sends a direction command, and then restores the previous speed.
+
+### Switch command
+
+    sw <switch> <S|C>
+
+Examples:
+
+    sw 1 S
+    sw 1 C
+
+The program records and prints the most recent switch positions commanded through the terminal.
+
+### Quit
+
+    q
+
+This exits the program and returns control to the Raspberry Pi bootloader/reboot output.
+
+## Lab Test Results
+
+The following tests passed on Track C:
+
+    tr 14 5: train 14 moved.
+    tr 14 0: train 14 stopped.
+    rv 14: train 14 reversed.
+    sw 1 S: switch 1 changed to straight.
+    sw 1 C: switch 1 changed to curved.
+    q: program returned to Raspberry Pi bootloader/reboot output.
+    Clock: displayed time advanced normally during testing.
+
+## Timing Notes
+
+The program uses the Raspberry Pi system timer for the displayed clock. The clock is not computed by counting loop iterations, so variations in loop runtime do not accumulate as clock drift.
+
+The on-screen single-iteration loop timing can display `0 us`. This is expected because one polling-loop iteration can complete in less than the 1 microsecond resolution of the Raspberry Pi system timer.
+
+During testing, the displayed clock advanced normally while the program continued accepting commands.
+
+## Known Limitations
+
+1. Sensor display is disabled in the clean terminal build.
+2. The switch position table records switch positions commanded by this program; it is not independent physical switch feedback.
+3. The terminal output avoids ANSI cursor-control sequences because `gtkterm` displayed those escape sequences as garbled characters.
+4. Detailed automatic sensor timing collection is not fully implemented.

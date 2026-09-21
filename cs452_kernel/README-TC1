@@ -1,0 +1,169 @@
+# TC1 Train Control
+
+Name: Yutong Wu  
+WatIAM: y68wu  
+
+## Build
+
+Build TC1 with:
+
+```bash
+make clean
+make MODE=TC1
+```
+
+This generates:
+
+```text
+iotest.img
+```
+
+## Upload and Run
+
+For the Track D Pi used during testing:
+
+```bash
+/u/cs452/public/tools/upload.sh ./iotest.img d8:3a:dd:1b:36:9e
+```
+
+Open the serial terminal with:
+
+```bash
+gtkterm -p /dev/ttyS0 -s 115200
+```
+
+## Implemented Commands
+
+### Train Speed
+
+```text
+tr <train> <speed>
+```
+
+The user-facing speed range is `0..120`, matching the CS3 speed scale.
+
+Examples:
+
+```text
+tr 14 20
+tr 14 60
+tr 14 100
+tr 14 0
+```
+
+`tr 14 0` stops the train.
+
+### Switch Control
+
+```text
+sw <switch> <S|C>
+```
+
+Examples:
+
+```text
+sw 2 S
+sw 2 C
+```
+
+### Route Setup
+
+```text
+route <target>
+```
+
+Example:
+
+```text
+route C8
+```
+
+This sets the switches required for the selected target.
+
+### Stop Plan Preview
+
+```text
+plan <target> <speed>
+```
+
+Example:
+
+```text
+plan C8 30
+```
+
+This previews the route/stop plan without moving the train.
+
+### Automatic Stop
+
+```text
+stop <train> <target> <speed>
+```
+
+Example:
+
+```text
+stop 14 C8 30
+```
+
+This command sets the route, starts the train, waits for the predicted run time, and then sends speed 0 to stop the train.
+
+### Demo
+
+```text
+demo
+```
+
+Runs the default route/stop demonstration.
+
+### Calibration / Observation
+
+```text
+cal
+targets
+obs <target> <speed> <ticks>
+status
+```
+
+`obs` compares an observed run time against the current prediction model. It does not move the train.
+
+## Implementation Notes
+
+Train commands are sent through the MCP2515 CAN controller.
+
+For the tested Track D setup, train 14 is controlled as MM address 14 using the locomotive speed CAN frame:
+
+```text
+CAN ID: 0x00085772
+DATA:   00 00 00 0E <speed_hi> <speed_lo>
+```
+
+The user-facing speed `0..120` is converted to a 10-bit Märklin speed value `0..1000`.
+
+The MCP2515 initialization was made more robust by explicitly entering configuration mode, writing the timing/configuration registers, and waiting for normal mode before sending CAN frames.
+
+For TC1, CAN sending is synchronous so terminal commands do not block indefinitely on the old asynchronous queue path.
+
+## Tested Commands
+
+The following were tested successfully on Track D with train 14:
+
+```text
+tr 14 20
+tr 14 60
+tr 14 100
+tr 14 0
+sw 2 S
+sw 2 C
+route C8
+plan C8 30
+stop 14 C8 30
+```
+
+## Commit
+
+Implementation commit before this README:
+
+```text
+5f524d2
+```

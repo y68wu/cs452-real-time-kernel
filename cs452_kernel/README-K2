@@ -1,0 +1,295 @@
+# CS452 Kernel Part 2
+
+## Author
+
+Chris Wu  
+User ID: y68wu  
+Student ID: REDACTED  
+
+## Repository
+
+https://git.uwaterloo.ca/y68wu/cs452_kernel2.git
+
+## Build Instructions
+
+Build in the `linux.student.cs.uwaterloo.ca` environment from the repository root:
+
+    make clean
+    make
+
+A successful build produces:
+
+    iotest.elf
+    iotest.img
+
+The Raspberry Pi image to upload is:
+
+    iotest.img
+
+## Upload and Run Instructions
+
+Upload the image to an available Raspberry Pi.
+
+Example using a specific Raspberry Pi MAC address:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img d8:3a:dd:1b:37:d9
+
+After uploading, reset the corresponding Raspberry Pi and view the output through `gtkterm` using:
+
+    /dev/ttyS0 115200-8-N-1
+
+## Current Test Program
+
+The current K2 test runs the full Rock/Paper/Scissors task interaction.
+
+The first user task:
+
+    creates the name server
+    creates the RPS server
+    creates four RPS clients
+    exits
+
+The RPS server:
+
+    registers itself as "rps"
+    receives signup requests from clients
+    pairs clients into games
+    receives play requests
+    replies with game results
+    handles quit requests
+
+The RPS clients:
+
+    find the RPS server using WhoIs("rps")
+    sign up to play
+    play two rounds
+    quit
+
+This test exercises Send, Receive, Reply, RegisterAs, WhoIs, the name server, the RPS server, and multiple RPS clients.
+
+## Expected Current Output
+
+The RPS test output should show this general sequence:
+
+    CS452 Kernel Part 1
+    Starting kernel...
+    FirstUserTask: creating name server
+    NameServer: started
+    Created NameServer: 2
+    FirstUserTask: creating RPS server
+    NameServer: registered rps as 3
+    RPS Server: registered as rps
+    Created RPSServer: 3
+    FirstUserTask: creating RPS clients
+    Created RPSClient1: 4
+    Created RPSClient2: 5
+    Created RPSClient3: 6
+    Created RPSClient4: 7
+    FirstUserTask: exiting
+    NameServer: lookup rps -> 3
+    RPS Client 1: WhoIs(rps) -> 3
+    RPS Server: signup from 4
+    RPS Client 2: WhoIs(rps) -> 3
+    RPS Server: signup from 5
+    RPS Server: paired 4 and 5
+    RPS Client 3: WhoIs(rps) -> 3
+    RPS Server: signup from 6
+    RPS Client 4: WhoIs(rps) -> 3
+    RPS Server: signup from 7
+    RPS Server: paired 6 and 7
+    RPS Server: play from clients
+    RPS Server: result lines
+    RPS Client result lines
+    RPS Server: quit lines
+    RPS Client quit status lines
+
+    Kernel: no ready tasks; halting.
+
+The observed output confirms that the RPS server can pair two independent client groups, process play requests, return win/lose results, and process quit requests.
+
+## Implemented Kernel Primitives
+
+K1 primitives:
+
+    Create(int priority, void (*function)())
+    MyTid()
+    MyParentTid()
+    Yield()
+    Exit()
+
+K2 message-passing primitives:
+
+    Send(int tid, const char *msg, int msglen, char *reply, int rplen)
+    Receive(int *tid, char *msg, int msglen)
+    Reply(int tid, const char *reply, int rplen)
+
+Name server wrappers:
+
+    RegisterAs(const char *name)
+    WhoIs(const char *name)
+
+## Program Structure
+
+Important source files:
+
+    boot.S          Raspberry Pi boot entry code
+    main.c          hardware initialization and kernel startup
+    kernel.c/h      kernel dispatcher, scheduler, exception handling, message passing
+    task.c/h        task descriptors, task stacks, ready queues, send queues
+    syscall.c/h     user-visible syscall wrappers
+    syscall_asm.S   SVC, exception vector, context save, context restore
+    nameserver.c/h  name server and RegisterAs / WhoIs wrappers
+    tasks.c/h       FirstUserTask and current smoke-test tasks
+    uart.c/h        busy-wait UART terminal output
+    rpi.c/h         Raspberry Pi GPIO setup
+    util.c/h        formatting helpers
+
+## Kernel Design
+
+The kernel uses static memory only. There is no heap allocation.
+
+The task descriptor stores:
+
+    task id
+    parent task id
+    priority
+    run state
+    saved stack pointer
+    entry function pointer
+    ready queue next pointer
+    send queue next pointer
+    per-task send queue head and tail
+    send message pointer and length
+    reply buffer pointer and length
+    receive buffer pointer and length
+    receive sender-tid pointer
+
+The current task states are:
+
+    TASK_UNUSED
+    TASK_READY
+    TASK_ACTIVE
+    TASK_EXITED
+    TASK_SEND_BLOCKED
+    TASK_RECEIVE_BLOCKED
+    TASK_REPLY_BLOCKED
+
+Each task has a statically allocated stack. Each task stack stores a saved context frame used during context switching.
+
+## Scheduling
+
+The scheduler uses static priorities.
+
+Lower numeric priority values represent higher scheduling priority. Each priority has a FIFO ready queue. Tasks at the same priority are scheduled round-robin.
+
+## Message Passing Design
+
+Send / Receive / Reply are implemented in the kernel.
+
+If a task calls Send to a receiver that is already receive-blocked, the kernel copies the message immediately into the receiver's buffer, records the sender tid, moves the receiver to ready state, and places the sender into reply-blocked state.
+
+If the receiver has not called Receive yet, the sender is placed into the receiver's send queue and becomes send-blocked.
+
+If a task calls Receive and a sender is already waiting in its send queue, the kernel dequeues the sender, copies the message into the receiver's buffer, records the sender tid, and makes the sender reply-blocked.
+
+If a task calls Receive and there are no waiting senders, the receiver becomes receive-blocked.
+
+Reply copies the reply message into the original sender's reply buffer and makes the sender ready again.
+
+## Current Limitations
+
+This repository is currently in progress for Kernel Part 2.
+
+Implemented so far:
+
+    Send
+    Receive
+    Reply
+    NameServerTask
+    RegisterAs
+    WhoIs
+    name-server smoke test
+
+Not implemented yet:
+
+    Rock/Paper/Scissors server
+    Rock/Paper/Scissors clients
+    final RPS game test
+    performance measurement task pair
+    PerfResults.csv final measured results
+    AwaitEvent
+    interrupt handling
+    clock server
+    terminal server
+    train control servers
+
+## Performance Measurements
+
+Performance measurement is not complete yet.
+
+The final submission will include a `PerfResults.csv` file with 48 rows. Each row will have:
+
+    optimization setting
+    cache setting
+    sender-first or receiver-first order
+    message size
+    measured Send/Receive/Reply time in microseconds
+
+## Generated Files
+
+Generated build files should not be committed.
+
+The repository ignores:
+
+    *.o
+    *.d
+    *.elf
+    *.img
+    *.map
+
+Before submission, verify with:
+
+    make clean
+    git status
+    git ls-files | grep -E '\.(o|d|elf|img|map)$'
+
+The last command should print nothing.
+
+## Performance Measurement Completion
+
+The performance measurements have been completed for all 48 required cases.
+
+The results are stored in:
+
+    PerfResults.csv
+
+The CSV contains one header row and 48 data rows. The measured cases cover:
+
+    optimization: opt, noopt
+    cache mode: none, icache, dcache, both
+    order: S, R
+    message size: 4, 64, 256 bytes
+
+The build system supports the following options for reproducing the measurements:
+
+    make OPT=-O3 CACHE=none MODE=PERF PERF_ITER=1000
+    make OPT=-O3 CACHE=icache MODE=PERF PERF_ITER=1000
+    make OPT=-O3 CACHE=dcache MODE=PERF PERF_ITER=1000
+    make OPT=-O3 CACHE=both MODE=PERF PERF_ITER=1000
+
+    make OPT=-O0 CACHE=none MODE=PERF PERF_ITER=1000
+    make OPT=-O0 CACHE=icache MODE=PERF PERF_ITER=1000
+    make OPT=-O0 CACHE=dcache MODE=PERF PERF_ITER=1000
+    make OPT=-O0 CACHE=both MODE=PERF PERF_ITER=1000
+
+Each performance build runs the six baseline cases in one boot:
+
+    S,4
+    S,64
+    S,256
+    R,4
+    R,64
+    R,256
+
+The output reports the average Send/Receive/Reply transaction time in microseconds.
+
