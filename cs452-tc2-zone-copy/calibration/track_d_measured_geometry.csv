@@ -1,0 +1,28 @@
+record_type,name,directed_anchor_or_speed,measured_value,converted_mm,opposite_anchor,notes
+destination,d1,A12,15,381,A15,operator point is midway between A11/A12 and A15/A16
+destination,d1,A15,15,381,A12,operator point is midway between A11/A12 and A15/A16
+destination,d2,B15,8.9,226,A4,equal directed offsets
+destination,d2,A4,8.9,226,B15,equal directed offsets
+destination,d3,C11,3.5,89,B6,C11/C12 side
+destination,d3,B6,10,254,C11,B5/B6 side
+destination,d4,C10,3,76,B2,C9/C10 side
+destination,d4,B2,11,279,C10,B1/B2 side
+destination,d5,E5,0,0,E6,coincident with E5/E6 detector centre
+destination,d5,E6,0,0,E5,coincident with E5/E6 detector centre
+destination,d6,E13,0,0,E14,coincident with E13/E14 detector centre
+destination,d6,E14,0,0,E13,coincident with E13/E14 detector centre
+destination,d7,E9,12,305,D6,E9/E10 side
+destination,d7,D6,12,305,E9,D5/D6 side
+destination,d8,D11,8,203,C15,equal directed offsets
+destination,d8,C15,8,203,D11,equal directed offsets
+train_geometry,train14,total_length,8,203,,rear starts flush with departure point
+train_geometry,train14,pickup_from_head,4,102,,pickup is at geometric centre
+stopping,train14,20,50,50,,direct millimetre command-to-rest measurement
+stopping,train14,40,110,110,,direct millimetre command-to-rest measurement
+stopping,train14,60,240,240,,corrected from d1 residual; 20 mm later stop
+stopping,train14,70,390,390,,direct millimetre command-to-rest measurement
+stopping,train14,80,530,530,,corrected from d1 residual; 20 mm later stop
+stopping,train14,90,740,740,,direct millimetre command-to-rest measurement
+stopping,train14,100,875,875,,corrected from second d1 residual; another 50 mm later stop
+stopping,train14,120,1435,1435,,corrected from d1 residual; 15 mm later stop
+velocity,train14,20,14.803,376,,E7-to-D7 in 787 ten-millisecond ticks; 478 um/tick

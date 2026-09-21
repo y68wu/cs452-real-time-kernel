@@ -1,0 +1,1 @@
+train,direction,start_sensor,end_sensor,user_speed,steady_distance_mm,steady_ticks,velocity_mm_per_10ms,stop_command_sensor,stop_distance_mm,stop_settle_ticks,ambient_notes,sensor_errors,notes

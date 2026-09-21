@@ -1,0 +1,16 @@
+model_index,user_speed_reference,nominal_velocity_tenths_mm_per_10ms,slow_bound_tenths_mm_per_10ms,fast_bound_tenths_mm_per_10ms,stop_distance_mm,provenance
+0,0,0,0,0,0,seed
+1,9,12,6,15,80,seed
+2,17,18,9,22,120,seed
+3,26,24,12,29,160,seed
+4,34,31,15,38,210,seed
+5,43,38,19,46,260,seed
+6,51,45,22,54,320,seed
+7,60,52,26,63,390,seed
+8,69,59,29,71,470,seed
+9,77,66,33,80,560,seed
+10,86,73,36,88,660,seed
+11,94,80,40,96,770,seed
+12,103,87,43,105,900,seed
+13,111,94,47,113,1040,seed
+14,120,101,50,122,1200,seed
