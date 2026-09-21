@@ -17,6 +17,11 @@ sensor attribution, cooperative terminal I/O, and reliable CAN transport.
 Original repository: https://git.uwaterloo.ca/y68wu/cs452_kernel.git  
 TC1 commit: d97b69d Complete TC1 calibrated routes and stopping
 
+Earlier A0 and kernel milestone source snapshots are preserved on the
+[`historical-coursework` branch](https://github.com/y68wu/cs452-real-time-kernel/tree/historical-coursework).
+A later, unverified three-train physical-demo variant is preserved on the
+[`remote-physical-demo` branch](https://github.com/y68wu/cs452-real-time-kernel/tree/remote-physical-demo).
+
 ## Build TC2
 
 Build on the linux.student.cs environment:
