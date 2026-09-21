@@ -1,0 +1,83 @@
+# CS452 Kernel Part 3
+
+## Author
+
+Chris Wu  
+
+## Repository
+
+https://git.uwaterloo.ca/y68wu/cs452_kernel.git
+
+## Build Instructions
+
+Build in the `linux.student.cs.uwaterloo.ca` environment from the repository root:
+
+    make clean
+    make MODE=CLOCK
+
+A successful build produces:
+
+    iotest.elf
+    iotest.img
+
+The Raspberry Pi image to upload is:
+
+    iotest.img
+
+Example upload command:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img d8:3a:dd:1b:39:65
+
+View serial output using:
+
+    gtkterm -p /dev/ttyS0 -s 115200
+
+## Current K3 Test Program
+
+The current K3 test creates:
+
+    the name server
+    the clock server
+    the clock notifier
+    one idle task
+    four clock client tasks
+
+The four clock clients use the assignment parameters:
+
+    priority 3, delay interval 10 ticks, number of delays 20
+    priority 4, delay interval 23 ticks, number of delays 9
+    priority 5, delay interval 33 ticks, number of delays 6
+    priority 6, delay interval 71 ticks, number of delays 3
+
+Each client obtains the clock server tid using WhoIs("clock"), then repeatedly calls Delay(). After each delay, it prints:
+
+    its tid
+    its delay interval
+    the number of completed delays
+    the current clock time
+
+## Observed Test Output
+
+The test output shows that:
+
+    the name server starts
+    the clock server registers as "clock"
+    the notifier is created
+    all four clients receive their configurations
+    all four clients complete their requested delays
+    the idle task continues running afterward
+
+Observed completed client counts:
+
+    delay 10: completed 20/20
+    delay 23: completed 9/9
+    delay 33: completed 6/6
+    delay 71: completed 3/3
+
+The idle task reports periodic idle output after all clock clients finish.
+
+## Current Implementation Note
+
+This version includes AwaitEvent(EVENT_TIMER), a clock notifier, a clock server, Delay(), DelayUntil(), Time(), clock clients, and an idle task.
+
+The current timer event path is implemented using a software timer wait queue based on the ARM counter. The next improvement is to connect AwaitEvent(EVENT_TIMER) to a real hardware timer interrupt path.

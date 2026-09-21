@@ -1,0 +1,143 @@
+# CS452 Kernel Part 4
+
+## Author
+
+Chris Wu  
+
+## Repository
+
+https://git.uwaterloo.ca/y68wu/cs452_kernel.git
+
+## Build Instructions
+
+From the repository root on `linux.student.cs.uwaterloo.ca`:
+
+    make clean
+    make
+
+The default build mode is K4 and produces:
+
+    iotest.elf
+    iotest.img
+
+Upload example:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img d8:3a:dd:1b:39:65
+
+Open the serial terminal:
+
+    gtkterm -p /dev/ttyS0 -s 115200
+
+Then reset the Raspberry Pi.
+
+## Operation
+
+The K4 test starts the name server, CAN server, terminal server, idle task, and a terminal command client.
+
+The command client supports:
+
+    tr <train> <speed>
+    rv <train>
+    sw <switch> <S|C>
+    help
+    q
+
+For reliable lab testing, the K4 image also runs an automatic command test at boot. It covers:
+
+    help
+    unknown command
+    invalid tr command
+    tr 14 0
+    tr 14 5
+    tr 14 14
+    tr 14 15
+    tr 300 5
+    invalid rv command
+    rv 14
+    rv 300
+    invalid sw command
+    sw 1 S
+    sw 1 C
+    sw 1 X
+    sw 300 S
+
+Valid commands should print `ok`. Invalid boundary/error cases should print either `failed`, `invalid ... command`, or `unknown command`.
+
+Examples:
+
+    tr 14 5
+    rv 14
+    sw 1 S
+    sw 1 C
+    q
+
+## Kernel Structure
+
+The kernel continues to use task descriptors, fixed-size stacks, priority-based ready queues, Send/Receive/Reply messaging, and AwaitEvent.
+
+K4 adds two I/O server structures:
+
+1. Terminal server:
+   - provides Getc and Putc wrappers;
+   - handles terminal output through Putc requests;
+   - handles terminal input through a stable server-side Getc path;
+   - keeps fixed-size circular buffers for RX/TX data;
+   - blocks client Getc requests until input is available.
+
+2. CAN server:
+   - initializes SPI0 and the MCP2515 CAN controller;
+   - provides CanSend and CanReceive wrappers;
+   - keeps fixed-size queues for pending transmit frames, received frames, and blocked receive clients;
+   - has RX/TX notifier tasks that use AwaitEvent(EVENT_TIMER) to avoid busy waiting while polling the MCP2515.
+
+The train command client translates terminal commands into CS2 CAN frames.
+
+## Protocol Notes
+
+The shifted CS2 identifier-field values are:
+
+    Lok Geschwindigkeit: CAN-ID value 0x08
+    Lok Richtung:       CAN-ID value 0x0A
+    Zubehör Schalten:   CAN-ID value 0x16
+
+The code helper accepts the unshifted Märklin commands (`0x04`, `0x05`,
+`0x0B`) and builds extended identifiers using:
+
+    (command << 17) | 0x4711
+
+The Track D locomotive controlled by this repository uses the same MM Loc-ID
+for speed and direction:
+
+    00 00 00 <train>
+
+## Limitations
+
+The final K4 implementation is structured as server-based I/O from the
+user-task perspective: clients do not access devices directly and all
+terminal/CAN operations go through I/O servers.  Terminal RX and TX use
+notifier tasks plus bounded server queues, so an idle `Getc` or full output
+queue does not stall unrelated clients.  The MCP2515 CAN path uses periodic
+`AwaitEvent(EVENT_TIMER)` notifier polling rather than a direct MCP2515
+hardware interrupt line, because the stable kernel exception path does not
+yet include a reliable external interrupt-controller path.
+
+The implementation uses fixed-size queues. If a queue is full, the relevant server call returns an error.
+
+## Expected Test Output
+
+On boot, the serial terminal should show:
+
+    FirstUserTask: starting K4 terminal I/O test
+    Created NameServer
+    Created CanServer
+    CanServer: MCP2515 initialized
+    CanServer: registered as can0
+    Created TerminalServer
+    TerminalServer: registered as terminal0
+    K4 Interrupt-Mediated I/O Train Controller
+
+Typing commands should echo input and print status messages such as:
+
+    tr sent: train=14 speed=5 ok
+    rv sent: train=14 ok
+    sw sent: switch=1 dir=S ok

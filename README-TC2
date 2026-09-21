@@ -1,0 +1,1151 @@
+# TC2 multi-train control
+
+Name: Yutong (Chris) Wu
+
+Repository: https://git.uwaterloo.ca/y68wu/cs452_tc1_only
+
+This image implements the TC2 dispatcher for the Track D layout using the
+Track B graph.  The safety policy is fail-closed: a train is not launched
+unless its route, braking/reversal guards, sensor service, reservation
+generation, and CAN transport are all healthy.
+
+## Build and test
+
+On `linux.student.cs`:
+
+```text
+make clean
+make
+```
+
+`MODE=TC2` is the default and produces `iotest.img`.  An explicit build is:
+
+```text
+make clean
+make MODE=TC2
+```
+
+Target warnings are build failures; a demo image is not produced from a
+warning-bearing AArch64 compile.
+
+The final line must be:
+
+```text
+Built and verified MODE=TC2 image: iotest.img
+```
+
+The linked-image gate also requires this runtime build marker:
+
+```text
+TC2 build marker: stage68-compound-zone-watchdog-latch
+```
+
+TC1, TC2, and PERF use separate `build/<MODE>/<config-id>/` object trees.  The
+configuration id includes the source set and tool/compile/link
+flags, the normal default ignores an ambient shell `MODE`, and the final link
+is rejected unless the requested mode's symbols and banner are present.  The
+root `iotest.elf` and `iotest.img` are copies of the verified selected-mode
+artifacts.
+
+Host regression tests use Clang with AddressSanitizer and
+UndefinedBehaviorSanitizer:
+
+```text
+make test
+```
+
+The tests cover route candidates and unavailable segments, a complete
+stop/reverse/turnout/resume/outbound-sensor path,
+asynchronous turnout preparation and repeated queue backpressure,
+scalable confirmed launch batching plus the physical four-train wave,
+ordered sensor monitoring, sliding reservations,
+all 128 exact directed-side-to-D and all 64 estimated D-to-D `CURRENT`
+planning/convergence cases, two-evidence relocalization,
+destination-and-generation compare-and-swap plan replacement,
+retained CAN batch status, emergency-stop ordering and retry,
+CAN/MCP2515 transport, terminal blocking behavior, and the fallback motion
+model, plus exhaustive speed-1..120 provisional prediction monotonicity and
+T14/A/d7 isolation.  The course
+AArch64 toolchain is still required for the linked image; host Clang tests are
+not a substitute for the physical Track D checks listed below.
+`TC2_REQUIREMENTS.md` provides the requirement-to-code/test traceability table.
+
+## Current live operator view
+
+The current Track D dashboard supersedes the earlier diagnostic-heavy
+renderer presentation.  It follows the supplied physical drawing orientation:
+A/B below, C/D/E/F above, d7 at the left, and d1 at the far right. It shows
+only the track, uppercase sensor-pair labels, lowercase d1-d8, train markers,
+active train number/color/speed entries, and one command input row.
+The four planned trains have allocation-order-independent colors:
+T13 green, T14 red, T15 blue, and T17 yellow.
+
+Stage 37 makes ordinary A-F to d1-d8 stopping a spatial decision on the
+selected shortest route. On every scheduler tick, the dispatcher compares
+the route-distance estimate with the exact operator destination minus the
+measured command-to-rest distance for the requested speed. Ordered sensors
+only rebase confirmed route distance; their raw timing cannot replace the
+stable command-speed velocity or directly issue a destination stop.
+
+The live marker is likewise independent of detector flashes. Physical
+detector events flash their labels and rebase route progress without moving
+the red `@`; the marker follows ordered map cells. The complete C-to-d1 path
+is covered through B7, A10, C7, E11, D10, D8, E8, C14, and A15, including
+every drawn horizontal, vertical, and diagonal segment.
+
+Stage 38 extends that ordered-cell rule to the complete 48-route A-F/d1-d8
+matrix. All 84 adjacent visual waypoint pairs are sampled by a host
+regression; the 25 bends that formerly crossed whitespace now use explicit
+ordered rail geometry. Unknown geometry holds the last valid rail cell
+instead of snapping to another sensor or branch.
+
+One `go` assigns every staged job the same launch epoch. Pairwise-disjoint
+routes cross a common turnout-confirmation/settle barrier and enter one
+four-train CAN speed batch; conflicting shortest routes remain stopped in
+WAIT_ROUTE until their reservation is safe. The physical CAN protocol still
+confirms the commands serially, so a small measured launch skew is expected.
+
+Live position combines a route-bound prediction with physical correction.
+Between sensors, the marker advances at the dispatcher prediction velocity
+through the published route waypoints. An attributed physical CAN sensor
+event immediately anchors it to that detector cell and flashes the complete
+physical sensor-pair label for 300 ms. ARRIVED/STOPPED settles at the
+lowercase operator endpoint. Any command entered while the map is active is
+executed by the normal parser and the complete live map is redrawn
+automatically; only `uioff` leaves the dashboard.
+
+The 2026-07-28 T14/A/80/d1 sequence stopped 90 mm short, then 70 mm short
+after the first +90 mm adjustment.  The current provisional route-control
+residual is therefore cumulative +160 mm.  This does not move the immutable
+physical D1 catalog point and remains `RETEST` until the next physical run.
+
+## Task topology and kernel support
+
+Lower numeric values have higher priority:
+
+- priority 0: TC2 bootstrap only; it creates the complete task topology and
+  exits before normal service scheduling;
+- priority 1: name server and clock notifier;
+- priority 2: clock server and bounded CAN RX notifier;
+- priority 3: CAN server, CAN TX notifier, and independent dispatch safety
+  supervisor;
+- priority 4: terminal, reservation, sensor, and dispatch servers plus the
+  terminal RX/TX notifiers, sensor courier, dispatch ticker, and interactive
+  command/UI task, with round-robin progress inside the control-plane class;
+- priority 15: silent idle task.
+
+The TC2 bootstrap must outrank the services it creates.  Under this kernel's
+strict fixed-priority scheduler, the previous priority-8 bootstrap could be
+starved by the aggregate priority-1..4 clock/CAN/sensor workload before it
+created the dispatcher and UI.  TC1 and the other build modes retain their
+original bootstrap priority.
+
+Before entering C, the boot path explicitly zeroes the linker-defined BSS
+range.  Raw network-boot images do not carry the NOLOAD BSS, and the loader
+may reuse RAM from an earlier image; without this step, stale CAN flags and
+timer/UART waiter pointers can corrupt the new scheduler.  Kernel startup also
+resets its event-list roots as defense in depth.
+
+The reservation, sensor, and dispatch servers are the single writers for their
+respective state.  The sensor courier is the only CAN sensor consumer.  The
+dispatcher waits for a bounded sensor-server/courier READY handshake before
+publishing a healthy scheduler; a missing handshake leaves launch disabled.
+Within one dispatcher pass, an equal-priority courier may publish heartbeat
+`N+1` after the dispatcher cached time `N`; Stage 8 treats only that bounded
+one-tick future skew as fresh.  A larger future skew, a heartbeat older than
+the normal age limit, or any new courier receive/time failure still fails
+closed and is reported separately from reservation and sensor-sequence
+failures.
+The dispatch ticker uses the raw hardware timer rather than depending on
+`Delay()`, and an independent supervisor watches dispatch heartbeat,
+logical-clock progress, and real microsecond elapsed time.  If any of them
+stalls while a train may be moving, the supervisor queues priority speed-zero
+commands for every active train.
+
+TC2's kernel-facing changes are cooperative terminal RX/TX notifiers and
+waiter queues, bounded CAN RX service, queued CAN TX completion, IPC peer-exit
+cleanup, and a silent idle path.  When a server exits, queued `Send` callers
+and delivered callers awaiting `Reply` are unblocked with an error before its
+task descriptor can be reused.  None of the safety hot paths prints directly
+to a possibly full UART.
+
+The controller has no floating-point requirement.  All AArch64 target code is
+compiled with `-mgeneral-regs-only`; link verification rejects any instruction
+whose operands name SIMD/FP registers.  Every exception frame therefore needs
+only `x0`-`x30`, `ELR`, and `SPSR`.  `context_frame_layout.h` is shared by C
+and assembly, and compile-time plus host regressions prevent layout or build
+policy drift.
+
+## Launch and destination map
+
+The six horizontal launch bays are:
+
+```text
+A=EN5  B=EN4  C=EN7  D=EN10  E=EN9  F=EN3
+```
+
+The two centre vertical buffer tracks are not launch bays.  The eight
+operator-facing destination regions have two directed localization-anchor
+sides:
+
+```text
+d1=A12/A15  d2=A4/B15  d3=C11/B6  d4=C10/B2
+d5=E5/D5    d6=E13/D14 d7=D7/D8   d8=C15/D11
+```
+
+`tc2_track_model.c` is the single source of truth for these 6 starts and
+8x2 directed endpoint sides.  Boot-time validation checks all entries against
+the generated 144-node Track B graph used for physical Track D: exactly
+80 direction-specific sensor nodes (40 physical reverse pairs), 22
+branch/merge turnout pairs, all six entry nodes, and all 16 destination
+anchors must agree.  Parser, route planner, diagnostics, prediction, and the
+Track D operations UI consume this shared model instead of maintaining
+independent name tables.
+
+These names bound physical parts intervals containing the operator marks;
+they are not aliases for the stopping points.  D1 splits the CAN-side
+A12-to-A15 24064 interval at 407/407 mm.  D2, D3, D4, and D8 split their
+identified 24077 intervals at 219/218, 176/175, 180/179, and 202/202 mm.
+D5 and D6 split their 24664 intervals at 188/188 and 141/141 mm.  Capture
+`7.pcapng` rejected the former d1=A12/A11 mapping: T14/A/80/d1 observed
+A1,C13,E7,D7,D9,E12,C8, no A11/A12, and stopped about 330 mm short.
+The measured A-to-D7 direction still uses a fixed physical base of 280 mm
+after sensor D7.
+Supervised T14/A/d7 calibration additionally applies a bounded
+signed speed-dependent endpoint-control correction.  The current correction
+anchors at speeds 20/40/60/80/100/120 are respectively
++66/+50/+32/+15/-99/-555 mm.  Stage 32 increased the C13-to-E7 graph edge by
+exactly 95 mm and rebased every controller correction by -95 mm; the fixed
++280 mm operator base and every effective physical endpoint are therefore
+unchanged.  Every integer speed 1..120 is covered by piecewise interpolation
+in provisional-velocity space; speeds below 20 clamp to +66 mm.  Positive
+values delay braking and negative values request braking earlier.  At speeds
+whose effective control point lies before physical
+sensor D7, the planner preserves the same scalar endpoint but uses E7 as the
+localization anchor; the user-visible destination remains D7.  These are
+explicit single-run physical anchors, not yet accepted repeated calibration.
+The measured D7-facing side is `CONFIRMED`; the remaining 15 directed sides
+are explicitly `PROVISIONAL` until individual measurements replace the
+parts-derived values.  Geometry evidence is kept
+separate from train/speed motion calibration: a confirmed endpoint position
+does not imply a calibrated braking curve for every train or speed.
+`trackview` and `trips` label the
+selected `anchor_sensor`, base offset, speed correction, effective endpoint
+offset, and whether that directed base is `CONFIRMED` or `PROVISIONAL`.
+
+Stage 19 adds a pure route-relative prediction planner shared by every
+`A-F`/`d1-d8`/directed-side/speed combination.  Given a validated route to
+one catalog anchor, it derives four separate scalar positions:
+
+```text
+physical operator endpoint
+speed-corrected control endpoint
+speed-zero command point
+minimum conservative reservation ceiling
+```
+
+Each scalar is re-anchored to the latest direction-specific node at or before
+that point, so a negative high-speed correction can move the command point to
+an earlier sensor without changing the logical destination.  Arithmetic is
+signed and range checked; a command point before the route start becomes an
+explicit immediate-stop plan rather than wrapping.  The exact evidence label
+is restricted to T14/A/d7/side 0 without a reversal. All other plans are
+labelled `TRANSFERRED_T14_A_D7`, including other trains, origins, destination
+sides, and reversed routes.  The transferred point model never shrinks the
+independent conservative collision reservation.
+
+Host regression exhaustively covers all
+`6 * 8 * 2 * 120 = 11,520` start/destination-side/speed plans on the generated
+Track D graph, plus route mismatch, range, re-anchoring, evidence, and safety
+ceiling invariants.
+
+Stage 20 binds this prediction metadata to the route actually selected for an
+ordinary fixed-start `dispatch`.  It recomputes evidence from the selected
+route, downgrades a nominal exact profile when the route is noncanonical, and
+never shrinks the independently computed physical reservation.  The Stage 20
+integration is diagnostic metadata only: it deliberately does not change
+physical speed commands, stopping deadlines, or arrival decisions, and it
+does not apply to `CURRENT` or the isolated `caldispatch` workflow.
+
+The dispatcher evaluates both sides; the first name is not a hard-coded
+default.  Unavailable-aware Dijkstra produces the minimum graph-cost forward
+and reversal-enabled candidate for each side, using physical distance plus a
+direction-change penalty.  After braking, turnout, body-clearance, and carried
+hold validation, the dispatcher selects the lowest-cost surviving candidate;
+an exact forward/reversal cost tie keeps the forward candidate.  For a stopped
+`CURRENT` train it also evaluates an explicit leading-reversal alternative so
+an unsafe under-train turnout change is not mistaken for a zero-distance
+arrival.  This is candidate-shortest planning, not a claim that the code
+enumerates every k-shortest graph alternative after a candidate fails a
+post-search safety check.
+
+Stage 21 replaces the old miniature outline with a complete bounded
+132-column Track D operations map.  The static background labels all six
+departure bays A–F, all eight operator destinations d1–d8, all 40 physical
+detectors as 80 separately directed sensor names (for example
+`A11<-o->A12`), and switches 1–18 plus 153–156.  It also prints a fixed
+right-side status/legend area, followed by the existing dispatch, sensor,
+block, and reservation diagnostics.  Operator destination labels are
+explicitly different from identically named sensor nodes: `D7 OP` is not
+sensor `D7`.
+
+This Stage 21 drawing is a validated static schematic rather than a scale
+drawing.  It does not yet claim live colored train markers, real-time sensor
+flashes, or new physical calibration.  Those dynamic overlays are a separate
+next stage so a static map cannot be mistaken for CAN-confirmed movement.
+
+Stage 22 adds the deterministic, allocation-free state layer for those future
+dynamic overlays.  It tracks up to 16 active trains with stable, mutually
+distinct terminal colors; keeps the 80 directed sensor labels separately
+addressable even when two directions share one physical detector; alternates
+each train marker on refresh; and retains a sensor highlight for 300 ms with
+100 ms visible phases.  Plan generation, UI position revision, and raw sensor
+journal sequence are independent wrap-safe domains, so an old trip, a stale
+model update, or a repeated detector event cannot create a ghost marker,
+reset a newer train position, or move a train from a stale physical event.
+Removing a train clears its active flashes and releases its color slot.
+Its last non-zero trip generation remains as a per-train tombstone, so an
+equal or older delayed update cannot recreate a removed marker; only a
+wrap-safely newer trip generation may create that physical train again.
+
+This is still a pure state-model stage: the terminal delta renderer and the
+periodic command-loop integration are intentionally not claimed yet.  Its
+default source is explicitly `OFFLINE SIMULATION / NO PHYSICAL MOTION`.
+Offline updates may be predicted or estimated, but are rejected if labelled
+sensor-confirmed; switching from live input to offline also downgrades any
+existing sensor-confirmed marker and clears live flashes.  Stage 22 adds no
+new physical endpoint evidence and performs no calibration while CAN is
+unavailable. Even in live mode, operator destinations d1–d8 remain virtual
+points and cannot be labelled sensor-confirmed; only their separately named
+physical detector anchors can carry that quality.
+
+Stage 23 adds the terminal primitive needed by a periodically refreshed map.
+`TryGetc` observes one byte already buffered by the terminal server and
+returns immediately with one of three unambiguous outcomes: byte `0..255`,
+`EMPTY`, or `ERROR`.  An empty poll never enters the bounded blocking-`Getc`
+waiter queue, so an idle 100 ms UI refresh cannot consume waiter slots or
+change the FIFO order of existing command clients.  The original blocking
+`Getc`, TC1 command loop, UART notifiers, and terminal message numbers 1–4
+remain unchanged.
+
+This Stage 23 commit is terminal infrastructure only.  It does not yet poll
+from `TrainControlTask`, redraw the map, move an offline train marker, or
+flash a sensor.  Those renderer and runtime-integration claims remain for
+later isolated stages.
+
+Stage 24 adds the pure, allocation-free terminal renderer.  It retains one
+132-column by 33-row map, draws the complete Track D schematic on the first
+call, and emits only changed contiguous ANSI runs afterward. Command input
+uses terminal row 34, keeping the dashboard inside a
+conventional 40-row lab terminal without refresh-induced scrolling.  All 16
+stable train colors are used for map markers and directed-sensor flashes.  A marker
+alternates emphasis on each refresh; an active detector label flashes for
+300 ms in 100 ms phases while preserving the full direction-specific text
+such as `A11` and `A12`.  Two or more trains assigned to one display cell
+produce one visible red `!` conflict marker rather than silently overwriting
+one another.
+
+Every offline frame prints the exact warning
+`OFFLINE PREDICTION / SIMULATION - NO CAN, NO PHYSICAL MOTION, NO LIVE SENSOR EVIDENCE`.
+Offline state labelled sensor-confirmed is rendered invalid instead of being
+accepted as physical evidence.  Conversely, a live frame can flash a detector
+only from sensor-confirmed CAN evidence; predicted or estimated crossings are
+rejected.  Each flash retains its source, quality, and trip generation, and a
+source-mode transition clears outstanding flashes so evidence cannot leak
+between live and simulated displays. Virtual operator endpoints d1–d8 still
+cannot be sensor-confirmed.  A failed output write invalidates the retained
+frame so recovery starts with a complete redraw.  A strict 35-by-132 virtual
+terminal test parses every emitted escape sequence, repeats the prompt restore
+100 times without scrolling, verifies all 80 directed sensor names, the
+16-color palette, independent A11/A12 flashes, conflict
+recovery, stale/missing/cross-source provenance rejection, delta-only redraws,
+sink-failure recovery, removed-trip generation tombstones including wrap, and
+ASan/UBSan bounds.
+
+Stage 24 is still a renderer boundary: `TrainControlTask` does not yet call it
+periodically, and this stage does not advance a predicted trip or invent live
+CAN observations.  Runtime polling, route-time animation, and terminal
+bandwidth acceptance remain separate later stages.
+
+Stage 25 adds the deterministic route-to-dashboard projection intended for the
+future offline animation runtime.  It takes the complete route already selected by
+the dispatcher plus that route's prediction; it never performs a second
+shortest-path search.  The complete route copy retains the braking/safety
+reservation suffix for audit.  Its semantic UI view is clipped at the exact
+operator endpoint: prediction uses only the prefix through the physical
+anchor, sensors/turnouts/reversals after the operator point are not drawn as
+remaining travel, and the safety suffix never becomes simulated motion.  The
+result is an ordered list of start, directed-sensor, turnout, reversal, and
+operator-destination waypoints.  Each waypoint names the exact semantic label
+cell on the immutable map, so `[A]` points at `A`, `[D7 OP]` points at `D7`,
+and co-located `A11`/`A12` remain separate directional events.
+
+The operator endpoint is an exact physical scalar, not necessarily a graph
+node.  When it lies inside an edge, its logical D waypoint retains the
+preceding real node only as provenance; the following sensor/turnout is
+excluded and no graph node is fabricated.  Physical anchor sensors, braking
+control points, and user destinations remain distinct.  This Stage-25
+contract covers ordinary fixed A-F dispatches whose endpoint is the catalog
+base/operator point.  `CURRENT`, localization retries, and supervised
+`caldispatch` speed-correction points are intentionally not projected until
+their separate provenance contracts are implemented.
+
+The projection is allocation-free, checks every route scalar and selected
+turnout direction, rejects catalog/layout mismatches, and makes its entire
+output deterministic by zeroing unused route storage.  An ASan/UBSan host
+matrix covers all `6 * 8 * 2 * 120 = 11,520` start/destination-side/speed
+plans and 96 speed-independent route geometries.  Canonical shortest routes
+exercise 65 of 80 directed sensors and 21 of 22 turnouts; that coverage is
+reported rather than inflated into a claim that unused graph elements were
+physically traversed.  This stage provides animation geometry only.  It still
+does not move a physical train, synthesize CAN confirmation, or periodically
+drive the renderer.
+
+## Stage 26 atomic dispatcher projection publication
+
+The dispatcher now exposes the Stage-25 projection through a compact,
+fixed-width, read-only IPC contract.  It first builds and validates the
+complete projection in private scratch.  Reservation CAS still decides
+ownership; a conflict or failed CAS publishes nothing.  Only after CAS
+success does the dispatcher copy an immutable header and waypoint payload,
+then commit the publication valid bit and the job summary token.
+
+Consumers read a header followed by pages of at most eight waypoints.  Every
+page request must repeat the exact train, publication serial, reservation
+generation, and launch epoch from that header.  Any old or mixed token is
+returned as `STALE`; an unsupported trip is `NOT_READY`; an out-of-range
+page is `BOUNDS`.  Unused page entries are canonical zeroes.  Re-stage,
+cancel, control failure, and physical removal invalidate the UI publication
+immediately, so no display can continue animating an obsolete route.
+Invalidating the display copy does not release physical protection:
+reservation ownership remains until the existing cancel/STOP_HOLD/operator
+remove workflow releases it.  An arrived job retains its projection until
+cancel or remove.
+
+This publication contract applies to ordinary fixed A-F dispatches whose
+prediction and physical endpoint are authoritative.  `CURRENT`,
+localization-only, and provisional `caldispatch` trips deliberately return
+`NOT_READY`; the dispatcher does not invent their origin, direction, or
+geometry.  The host regression reconstructs every published page, checks
+token staleness and lifecycle invalidation, and retains the Stage-25
+11,520-case geometry evidence as its upstream route basis.  Stage 26 still
+does not advance simulated time, move a train, synthesize live sensors, or
+claim a new physical Track D run.
+
+## Stage 27 deterministic offline multi-train runtime
+
+The immutable Stage-26 publication can now be consumed by an allocation-free,
+prediction-only runtime with 16 fixed train slots.  It advances each accepted
+projection with the shared calibrated fixed-point velocity model, supports
+`uint32_t` tick wrap, interpolates terminal-cell coordinates without floats,
+and emits start, wait, resume, directed-sensor pulse, turnout, reversal,
+arrival, and failure events.  Every event is explicitly marked
+`PREDICTED_OFFLINE` and `is_live=0`; this module never sends CAN traffic,
+changes a turnout, or acquires/releases the physical reservation service.
+
+Conflict arbitration is deterministic and fail-closed.  A train claims the
+current movement window by graph vertex, normalized physical edge,
+co-located direction-sensor detector pair, turnout, and destination
+footprint.  An overlapping candidate remains stopped in `WAIT_CONFLICT`.
+Older waiting work wins before a younger launch, with train number as the
+final stable tie break.  Claims shrink as progress advances and an arrived
+train retains only its destination footprint.  Projection ingestion is
+atomic: incomplete, reordered, stale-token, non-canonical-tail, aliased, or
+out-of-bounds pages cannot create a runnable trip.
+
+The sanitizer regression covers all `6 * 8 * 120 = 5,760` A-F/d1-d8/speed
+requests, 1/2/3/4/6/16-train cardinalities, all 80 direction-specific
+sensors (including separate A11/A12 identities), FIFO conflict release,
+event provenance, tick wrap, and paged-publication failures.  This is still
+offline software evidence.  The periodic command loop, live renderer
+connection, and any new physical Track D claim remain separate later stages.
+
+## Stage 28 pure offline route planner
+
+`tc2_offline_planner.c` is a side-effect-free value transformer for every
+A-F origin, d1-d8 operator destination, and integer speed 1..120.  It uses
+the validated Track D catalog, the same generalized-cost shortest-path
+machinery and reversal rules as the dispatcher, the shared calibrated
+prediction model, and the Stage-25 projection contract.  Its output is one
+complete immutable projection that the offline runtime can consume; it
+neither grants motion authority nor calls CAN, IPC, live sensors, or the
+physical reservation service.
+
+Planning is deterministic and fail-closed.  Rebuilding the same request must
+produce the same route, prediction, publication token, and waypoint bytes.
+Invalid arguments, a mutated catalog, an unreachable graph, a route-guard
+failure, or a projection mismatch return an empty non-runnable result.
+The input track graph is checked byte-for-byte after the matrix so the
+planner cannot hide state in shared topology.
+
+The ASan/UBSan regression builds and validates all
+`6 * 8 * 120 = 5,760` requests twice, exercises a synthetic edge cut that
+requires a sensor-pair reversal, proves a cut origin is unreachable, rejects
+catalog mutation and invalid bounds, and statically excludes CAN, IPC,
+reservation, and live-sensor calls.  These results establish deterministic
+offline planning only.  Periodic command processing and terminal animation
+are integrated by Stages 29-31 below; physical Track D stopping remains
+separate acceptance work.
+
+## Stage 29 nonblocking atomic terminal frames
+
+The incremental renderer now publishes through a bounded three-slot transmit
+pump: one immutable active frame, one pending frame, and one private staging
+frame.  Each slot is 16 KiB and every drain attempt is an all-or-none chunk of
+at most 192 bytes.  `TerminalTryWrite` either accepts the complete chunk,
+returns `WOULD_BLOCK` without accepting a byte, or reports a hard error.
+Backpressure therefore preserves the exact byte offset and cannot interleave
+two frame generations.  A hard or ambiguous output failure discards queued
+bytes, invalidates deltas, and requires a later full redraw.
+
+Begin/stage/commit is one publication transaction.  Generations are nonzero
+wrapping serial numbers; equal, older, and exactly half-range values are
+rejected.  The caller's complete style reset, cursor position, prompt, and
+partially typed input are appended verbatim to the frame.  The pump does not
+invent prompt bytes.  Conflicting delta publication is rejected until a full
+frame re-establishes terminal state.  Host tests cover partial draining,
+repeated backpressure, pending-frame replacement rules, generation wrap,
+oversize and malformed transactions, output failure, full-redraw recovery,
+and exact prompt restoration.  This transport evidence is not CAN traffic or
+physical train motion.
+
+## Stage 30 bounded offline controller
+
+`tc2_offline_controller.c` owns the complete prediction-only pipeline in
+static/BSS storage:
+
+```text
+planner -> deterministic runtime -> provenance overlay
+        -> delta renderer -> atomic nonblocking transmit pump
+```
+
+The controller supports at most 16 records, validates every A-F,
+d1-d8, and speed-1..120 request before staging it, starts one or all staged
+trips, advances only on caller-supplied absolute 10 ms ticks, and removes a
+trip without leaving an old-generation marker.  Runtime events are accepted
+only when their train, plan generation, source, and non-live prediction
+provenance match the retained job.  A mismatch or impossible transition
+fails the controller closed until an explicit reset.  Rendering and draining
+are independently bounded so terminal backpressure never changes simulated
+time or conflict ordering.
+
+The retained overlay gives every active train a stable distinct color, pulses
+its marker on refresh, and flashes the exact direction-specific detector
+label for 300 ms.  Co-located directions such as A11/A12 remain independent
+events.  Conflicting trains enter deterministic `WAIT_CONFLICT`; disjoint
+trains advance together.  Every controller frame contains the exact evidence
+label:
+
+```text
+OFFLINE SIMULATION / PREDICTED / NO CAN / NO PHYSICAL MOTION
+```
+
+That label is a safety boundary, not decoration.  No controller API sends
+locomotive speed, changes a turnout, reads a live detector, or acquires a
+physical reservation.
+
+## Stage 31 integrated offline UI evidence
+
+Stage 31 connects the pure planner, 16-train runtime, colored provenance
+overlay, delta renderer, atomic frame pump, and bounded terminal bulk
+transport into one deterministic software validation surface.  The static
+Track D map labels all six A-F launch points, all eight operator destinations,
+switches 1-18 and 153-156, and all 80 direction-specific sensor identities.
+Predicted train positions move between route waypoints, marker phase changes
+make each refresh visible, and predicted sensor crossings flash in the
+matching train color without being presented as live feedback.
+
+The software acceptance matrix covers every
+`6 * 8 * 120 = 5,760` A-F/d1-d8/speed request and the required
+1/2/3/4/6/16-train cardinalities.  It checks deterministic re-planning,
+stable colors, predicted sensor provenance, concurrent disjoint progress,
+conflict waiting and release, bounded stepping/rendering/draining, terminal
+backpressure, generation isolation, removal, reset, and fail-closed
+recovery.  This entire matrix has the following status:
+
+```text
+OFFLINE SIMULATION / PREDICTED / NO CAN / NO PHYSICAL MOTION
+```
+
+It is software-only validation.  It does not certify physical CAN delivery,
+turnout actuation, locomotive movement, stopping accuracy, live detector
+ordering, or real collision avoidance.  Those claims still require the
+physical Track D checklist below after CAN is restored.
+
+## Stage 32 Track D geometry reconciliation
+
+Stage 32 applies the instructor-endorsed physical-parts audit to both
+directions of four Track D edges:
+
+- C13-E7 and E8-C14 are 875 mm instead of 780 mm;
+- D5-E6 and E5-D6 are 376 mm instead of 282 mm;
+- D9-E12 and E11-D10 are 369 mm instead of 282 mm;
+- E10-E13 and E14-E9 are 376 mm instead of 282 mm.
+
+The reported BR153-EN1 discrepancy is not backed by an endorsed replacement,
+so that edge deliberately remains 253 mm.  The C13-E7 change lengthens the
+A-to-D7 graph route by exactly 95 mm.  Subtracting exactly 95 mm from all six
+T14/A/d7 controller corrections preserves the fixed +280 mm operator base,
+the speed-specific control points, and every physical stopping target.
+Historical raw calibration rows are retained verbatim; this is a graph
+geometry reconciliation, not a new physical stopping run.
+
+The Stage-32 host matrix validates 48 A-F-to-d1-d8 operator routes, 96
+directed destination sides, and every speed 1..120, for 11,520 prediction
+cases.  It also checks graph adjacency and distance sums, turnout sequences,
+direction-specific sensor replay, prediction bounds, and reservation guards.
+These results are deterministic offline software evidence.  They do not
+establish CAN delivery, turnout actuation, physical train motion, live
+detector timing, endpoint accuracy, or real collision avoidance.
+
+## Normal workflow
+
+Before the first trip, physically place each stopped train at its declared
+A–F bumper, facing into the layout.
+
+Stage any number of jobs up to the 16-record scheduler capacity.  The same
+launch epoch may use each physical A–F bay at most once:
+
+```text
+dispatch 77 A 8 d5
+dispatch 78 C 8 d2
+dispatch 79 F 7 d4
+go
+```
+
+Every dispatch command contains the train number, origin, speed, and
+destination.  `go` submits all currently staged jobs as one epoch.  The
+scheduler makes one oldest-first admission pass.  Each candidate is planned
+from fresh sequential reservation and sensor snapshots, and the reservation
+server performs the atomic conflict check after planning; the resulting
+admitted set is maximal for that pass.  Jobs that conflict remain stopped in
+`WAIT_ROUTE` and retry in oldest-first order.  Admitted jobs enter `PREPARING`,
+queue their turnout commands without blocking the dispatcher, wait for every
+matching CS3 response, and cross one common settle barrier before one queued
+speed-command wave.  The CAN protocol still serializes those commands and
+their confirmations; the UI records the resulting launch skew rather than
+claiming physically simultaneous transmission.  A later disjoint job can be
+prepared while other trains remain in motion; this is not limited to two
+trains.  Temporary CAN queue pressure is backpressure, not a transport
+failure: a job remains `PREPARING` or `READY` and retries without bypassing
+its confirmation barrier.
+
+The command parser accepts the Märklin user-speed range `1..120`, but an
+operational TC2 run must use only train/speed/direction combinations that have
+been measured on Track D and shown to move without stalling.  An uncalibrated
+low value is not a valid graded or unattended operating speed merely because
+the parser accepts it.  A model-derived braking deadline is never treated as
+physical sensor evidence.  For a virtual endpoint, the directed anchor must
+first be observed in route order; the train then continues through the
+configured offset and stops by the timer/model.  This arrival remains
+explicitly estimated, and the complete endpoint/braking hold stays reserved
+until the normal `cancel` then `remove` operator workflow.  A stop before its
+required anchor is `STOP_UNCONFIRMED`; a downstream guard sensor observed
+before the model stop fails closed rather than silently accepting an
+overshoot.
+
+## Supervised all-speed prediction workflow
+
+To avoid waiting for a complete per-speed calibration table before collecting
+useful runs, Stage 15 retains a deliberately isolated first-pass predictor:
+
+```text
+caldispatch 14 A <speed 1..120> d7
+go
+trips
+```
+
+This command accepts exactly train 14, launch bay A, destination d7, and one
+integer speed from 1 through 120.  It rejects `CURRENT`, every other
+train/origin/destination, reversal or D8-side route, and any run while another
+managed job exists.  Once it is staged, ordinary jobs are rejected until the
+calibration job completes the normal cancel/remove lifecycle.  Tests must be
+supervised and should progress upward from a known moving speed; parser
+acceptance does not prove that a very low command can overcome physical
+stiction.
+
+Before the first ordered sensor interval, the provisional velocity curve
+continuously interpolates every speed 1..120 using the shape of the old seed
+knots, normalized to the observed steady T14/A-direction speed-20 value:
+
+```text
+speed 20 = 396 um per 10 ms tick = 39.6 mm/s
+```
+
+The first stopping prediction uses a constant-deceleration scaling from the
+same run:
+
+```text
+stop_um(speed) =
+  ceil(10243 * velocity_um_per_tick(speed)^2 / 396^2)
+```
+
+Thus speed 20 predicts exactly 10,243 micrometres from the speed-zero request
+to the pickup-leading-edge stopping point, while speed 120 initially predicts
+261,275 micrometres.  The UI also prints a whole-millimetre rounded display
+(11 mm and 262 mm respectively), but that rounded-up display value is never
+used for point-deadline arithmetic.  After every accepted ordered sensor
+interval, Stage 15 replaces that fallback with:
+
+```text
+observed_velocity_um_per_tick =
+  round(segment_distance_mm * 1000 / elapsed_10ms_ticks)
+```
+
+The velocity-squared stopping prior is recomputed from that observation.
+After every accepted sensor event, the timer is re-anchored and speed zero is
+scheduled at:
+
+```text
+anchor_tick +
+ceil((remaining_to_user_D7_mm * 1000 - predicted_stop_um) /
+     velocity_um_per_tick)
+```
+
+For the confirmed A-to-D7 direction, physical sensor D7 is 280 mm before the
+operator endpoint.  The supervised controller applies these signed
+speed-correction anchors:
+
+```text
+speed:                  20   40   60   80   100   120
+correction after base:  +66  +50  +32  +15  -99  -555 mm
+effective D7 offset:    346  330  312  295  181  -275 mm
+```
+
+The effective A-to-user-D7 distances are therefore
+2570/2554/2536/2519/2405/1949 mm at those speeds.  All intervening integer
+speeds interpolate continuously in provisional-velocity space; speeds below
+20 clamp to +66 mm.  The graph route is now 95 mm longer while each
+correction is 95 mm smaller, which is why these physical distances are
+unchanged.  A valid observed interval re-estimates velocity and
+re-anchors the deadline at runtime.  Negative correction is a control-timing
+adjustment, not negative track geometry.  At speed 120 the request point is
+275 mm before physical sensor D7, equivalently 101 mm after E7; E7 is therefore
+used as the localization anchor while the logical destination remains D7.
+The collision reservation still covers the complete conservative braking and
+turnout footprint.  The old Stage-9 rule requested zero
+immediately at physical D7, while the Stage-10 +180 mm run still stopped
+100 mm before the user endpoint.
+
+This point timer does not replace collision protection.  Reservations and
+turnout guards still use the much larger shared
+`Tc2MotionBrakingDistanceMm()` envelope, the physical D7 anchor is required
+before timer arrival, the sensor journal remains active while coasting, and a
+stop without that anchor evidence becomes `STOP_UNCONFIRMED`.  Reaching a
+later route sensor before the virtual endpoint stop is an overshoot/fault and
+causes a fail-closed stop.
+`trips` identifies the run as `PROVISIONAL_T14_A_D7` and prints velocity,
+exact predicted stopping distance plus its rounded display value, the last
+sensor/tick/distance anchor, predicted speed-zero request tick, actual request
+tick, matching CAN-confirmation tick, signed request timing error, and the
+actual stop trigger.  `cal` prints representative knots and states that all
+intermediate integer speeds are interpolated.  If the exact no-reversal
+A-to-D7 profile is unavailable, `caldispatch` remains stopped in `WAIT_ROUTE`;
+it never launches an unmodelled alternate.
+
+After a train has settled at a destination, a new trip can be staged from its
+managed position:
+
+```text
+dispatch 77 CURRENT 8 d3
+go
+```
+
+`CURRENT` is accepted only when the dispatcher has a retained position and
+live reservation for that train.  It is not an operator-supplied guess.  The
+old hold is copied from the reservation server and atomically unioned with the
+new route under an expected old destination and generation; a stale or
+conflicting replacement leaves the old hold unchanged.
+
+Even an exactly corroborated arrival keeps its old body/tail hold until
+ordered progress on the new trip makes it safe to release.  Every `CURRENT`
+plan preserves the preceding CS3-confirmed final-leg turnout plan.  A setting
+for a turnout inside the carried hold may be reused only when it is identical,
+and its command is deliberately omitted so the turnout is not actuated under
+the train.  A required leading direction change is issued and confirmed while
+the train is stopped, before it can join the common launch barrier.
+
+If the arrival position is estimated, the dispatcher uses only a
+same-direction forward candidate and strictly forbids any leave-then-reenter
+of the carried physical footprint before localization.  The initial speed is
+no faster than the smaller of the old and requested speeds.  A first plausible
+expected sensor does not release the old footprint because it could be the one
+false report.  Only a second later, physically plausible route occurrence
+localizes the train, releases the carried ambiguity through the normal
+body-tail window, and permits the requested speed.
+
+If an exact or estimated `CURRENT` route would require an unsafe carried-hold
+turnout change, the train first follows the already confirmed direction to a
+two-sensor clearance/localization point, stops, and automatically restages the
+original destination.  This repeats conservatively, with a hard 16-phase
+bound, until the requested route is safe; the operator does not issue another
+command.  A foreign reservation, blocked destination, exhausted phase bound,
+or absence of both a requested and a safe clearance route leaves the train
+stopped in `WAIT_ROUTE`.
+
+Inspection and lifecycle commands are:
+
+```text
+trips
+trackview
+sensors
+positions
+cancel <train>
+remove <train>
+```
+
+`cancel` sends speed zero and retains protection while the motion model waits
+through a speed-derived conservative settling interval, measured from the
+fresh tick after the matching CAN confirmation.  `remove` is accepted only
+after that settled stop and means the operator has physically lifted the
+train; only then is its remaining reservation released.
+
+## Unavailable track
+
+An operator may remove a physical landmark and its reverse direction from
+route finding:
+
+```text
+block <node>
+unblock <node>
+blocks
+```
+
+Blocking is rejected while the physical node is active or reserved.  A
+waiting job replans around blocked nodes and reservations; the reservation
+server performs the final atomic conflict check so a stale planning sample
+cannot launch two trains into the same footprint.
+
+## Routing and direction changes
+
+The automatic planner:
+
+- compares both directed sides of every d1–d8 region;
+- excludes the physical pair for every blocked, occupied, or other-train
+  reserved node;
+- permits reversal transitions only between a sensor and its reverse sensor;
+- divides a reversal route into motion legs;
+- configures only the current leg's turnouts;
+- performs a zero-distance leading reversal while stopped and before any
+  positive-speed launch command;
+- rejects consecutive zero-distance reversals as a non-canonical route;
+- for any zero-motion result, confirms the selected final braking-extension
+  turnout plan before publishing `ARRIVED`; a leading reversal must also
+  finish its post-confirmation settle interval;
+- preconfigures the directed braking extension beyond a final target so a
+  possible overrun cannot enter an unmonitored turnout branch;
+- stops and settles before issuing reverse, queues the next leg's turnout
+  commands while stopped, waits for every CS3 confirmation, settles again,
+  and then resumes;
+- rejects a reversal whose next required turnout is closer than one train
+  body plus model uncertainty, and applies the same protection to a
+  `CURRENT` departure;
+- if the reversal-shaped sensor report is the one false report, retains the
+  whole incoming ambiguity corridor and full-speed forward stopping guard,
+  and forbids every next-leg turnout resource in that area from changing;
+- at a reversal, sends speed zero when the fast-bound approach reaches the
+  calibrated stopping-distance trigger; the larger reserved braking guard
+  contains the uncertainty/overrun envelope, sensors remain live during
+  coast, and missing reversal evidence fails closed after the speed-derived
+  settle interval;
+- never applies a future-leg turnout plan across a reversal boundary.
+
+Physical distance is recomputed from ordered route occurrences.  Repeated
+nodes are not confused with an earlier traversal, and a reversal hop
+contributes no track distance.
+
+## Collision avoidance and reservations
+
+The reservation server is the single writer for physical ownership.  Each
+route claim includes both directed nodes for every physical landmark plus:
+
+- the train body/tail behind its confirmed position;
+- the complete remaining route;
+- conservative braking guards at the final destination and every reversal;
+- motion-model uncertainty.
+
+Updates are atomic and carry a per-train plan generation.  A `CURRENT` plan
+replacement also compares the expected old destination and generation before
+changing any owner.  A sensor event or footprint update from an older
+generation cannot advance the train.  As
+ordered sensor progress is confirmed, the train releases track behind its
+tail while retaining every future motion and stopping guard.  Arrival keeps a
+conservative hold zone covering the train body and observed braking envelope.
+An exact target report awaiting later corroboration instead retains its
+anchor-based remaining footprint, and a later `CURRENT` trip keeps the union
+until two-evidence localization.  A timer-only stop whose last confirmed
+occurrence is still before the target is not an arrival: it remains in
+`STOP_UNCONFIRMED` with the complete remaining hold until operator removal.
+
+Turnout commands are sent only after the protected footprint is owned.
+Unexpected turnout activity between `CURRENT` staging and its reservation CAS
+is compared against the preserved ARRIVED baseline and rejected before the old
+plan changes.  The two central double-turnout pairs are reserved and
+commanded as interlocked physical resources; a curved command first places
+its mate straight.  A
+second train cannot reserve the physical turnout while the first train or its
+tail may occupy it.  The CAN server accepts turnout batches only from the
+registered dispatcher, while an unexpected physical turnout report during
+motion fails the active trip closed.  The TC2 build disables legacy `tr`,
+`sw`, `route`, `stop`, `demo`, `reserve`, and `release` commands even when the
+scheduler is idle; all movement and protection changes go through
+`dispatch`/`go`/`cancel`/`remove`.
+
+## Sensor attribution and one-error behavior
+
+The sensor courier is the only CAN sensor consumer.  It processes at most four
+raw CAN frames per burst before blocking on the hardware timer, so continuous
+status or non-sensor traffic cannot monopolize its priority class.  The
+priority-0 bootstrap creates the complete topology before service load begins,
+and the sensor courier, dispatcher ticker, and UI share the priority-4
+round-robin class with the servers they use.  Continuous CAN traffic, long UI
+output, or terminal backpressure therefore cannot suppress bootstrap
+completion or the 20 ms dispatcher tick.  The bounded CAN RX hardware
+notifier remains priority 2 and the independent emergency supervisor remains
+priority 3.
+Rising events are attributed through the reservation server and stored in a
+bounded per-train journal with reservation generation and a monotonic sequence.
+
+Launch and continued motion also require the sensor server to be registered
+and its courier to have been created and to report ready.  CAN receive or
+forwarding failures and sensor-clock failures are exposed in the snapshot;
+any new failure after route preparation prevents launch or stops the affected
+motion.  Failure paths and every bounded successful receive burst block on the
+hardware timer.  Startup-stage serial diagnostics identify state
+initialization, registration, reservation lookup, and courier creation before
+the normal UI begins.
+
+For each motion leg the route monitor expects ordered sensor occurrences:
+
+- the expected sensor advances normally;
+- the next-next sensor may advance once while recording one missing sensor;
+- duplicate/old sequence numbers never advance;
+- one unrelated attributed sensor is ignored and counted;
+- one globally unattributed rising report is ignored for the active set and
+  counted, while a second fails every affected trip closed;
+- a second missing/spurious error, journal loss, generation mismatch, sensor
+  service failure, or attribution failure stops the train and retains its
+  reservation.
+
+A target-shaped pulse cannot release track unless a later ordered occurrence
+corroborates it.  Without that corroboration, speed zero is still sent, the
+anchor-based remaining footprint is retained, and the position is marked
+estimated.  A later `CURRENT` command is safe because it carries that entire
+owner set into an expected-plan atomic replacement, forbids ambiguous
+turnout/reversal choices, and requires two later ordered occurrences before
+shrinking it.  If direct routing is not yet safe, the bounded internal
+clearance/localization phase stops and automatically replans toward the
+original d1–d8 request. A sensor event or unsolicited turnout change between
+staging and preparation, or a turnout change while the train is held at
+`ARRIVED`, prevents launch instead of being absorbed into a new baseline.  If
+the final target report is the one missing sensor, the same conservative rule
+applies.
+
+The course protocol marks the 16-bit sensor timestamp as ignorable, so CAN
+arrival order is authoritative.  A redundant explicit `1 -> 1` report is
+suppressed while the sensor is already high.  A later delivered protocol
+`0 -> 1` is instead accepted as a new occupation because it may be the first
+evidence after a lost release; identical opaque timestamp bytes cannot prove
+that it is a retransmission.  This policy accepts long gaps and timestamp wrap
+without imposing an invalid half-wrap ordering rule.  The attributed-event
+sequence skips its reserved zero sentinel and journal paging/loss detection
+remains ordered across `uint32` wrap.
+CAN receive-buffer overflow and dropped frames are surfaced in CAN health and
+cause running trains to fail closed.
+
+## CAN and terminal reliability
+
+All terminal input/output uses the terminal server.  `Getc` with no input
+blocks only its caller; RX/TX notifiers and bounded queues allow the dispatch
+ticker, sensor courier, and safety servers to keep running while the prompt is
+idle or a large view is printed.  `TryGetc` is a separate nonblocking
+observation used by periodic UI clients: it returns a buffered unsigned byte,
+an explicit empty result, or an explicit transport/server error.  Repeated
+empty polls do not allocate blocking waiter entries and do not disturb
+blocking-`Getc` FIFO order.
+
+CAN transmit requests are queued.  The MCP2515 TX buffer is never aborted or
+overwritten merely because it is busy.  After TXREQ clears without ABTF,
+MLOA, or TXERR, a critical speed, direction, or turnout command remains
+pending until the CAN server receives the matching CS3 response with the same
+command, DLC, and data and the response bit set.  Only then may the next
+command in that batch proceed.  Controller or response timeout, malformed
+traffic, software drops, and RXB0/RXB1 hardware overflow update health and
+fail motion closed.
+
+Emergency speed-zero batches cancel queued launch/turnout traffic and queued
+reverse/resume controls.  The one command already on the wire completes
+or reaches its bounded timeout first, preserving the CS3
+one-command/one-response rule; the stop is next.  Their completion tokens
+remain pending until every stop receives its CS3 confirmation.
+Stale-response quarantine cannot poison an identical absolute speed/turnout
+retry, while a direction-toggle ambiguity fails closed.  A full retry request
+never discards already queued emergency stops.  Temporary queue exhaustion
+returns `BUSY` without incrementing transport-failure health, and the
+dispatcher retries behind its preparation/launch barrier.  Terminal batch
+states use a rotating retention pool so a new batch cannot immediately
+overwrite a completion before the dispatcher observes it.  TX and RX notifier
+heartbeats plus the sensor-courier heartbeat are runtime launch/motion gates;
+ordinary server traffic can continue TX progress even if the TX notifier
+stops.  The `sensors` command exposes courier readiness, heartbeat, receive
+and failure counters, while `trips` names the exact sensor-health subfault
+that caused a fail-stop.
+
+## UI fields
+
+`trips` and `trackview` keep every managed train visible and report:
+
+- train, origin, speed, destination region, planned `anchor_sensor`, user
+  endpoint offset and confirmation status (reported separately from the
+  observed position);
+- launch epoch/state and conflict/wait reason;
+- confirmed or estimated current node, next expected sensor, route progress,
+  remaining distance, and reservation generation;
+- current motion leg and completed/total reversals;
+- missing, spurious, duplicate, or journal-loss diagnostics;
+- braking/arrival hold state and fail-closed reason;
+- for `caldispatch`, provisional velocity/stop prediction, the most recent
+  sensor time/distance anchor, predicted/actual speed-zero request ticks,
+  matching CAN-confirmation tick, signed request timing error, and trigger;
+- CAN failure/drop counters and launch skew.
+
+`actual_request_tick` is the application `Time()` sample taken immediately
+before the speed-zero CAN IPC.  `confirmed_tick` is the client-side `Time()`
+sample taken after the matching CS3 response returns.  They bound software
+request/confirmation timing but are not exact on-wire timestamps; retain the
+Wireshark capture for transport-level timing.  If an operator cancels before
+the automatic prediction trigger, the row has no automatic trigger and must
+not be used as calibration evidence.
+
+The reservation and sensor views are sequential service snapshots and are
+labelled as samples; they do not claim cross-server atomicity.
+
+## Calibration data
+
+Version-controlled data is in `calibration/`.  The fallback model is explicitly
+labelled `seed`; it is not presented as a physical measurement.  Velocity is
+fixed-point tenths of a millimetre per 10 ms tick.  Separate slow/nominal/fast
+bounds drive watchdog, display, and braking/earliest-arrival calculations, so
+the historical centimetres/second values are never misread as whole
+millimetres per tick.  Train-specific lab observations must be appended using
+`calibration/track_d_measurement_template.csv` and the code/data updated
+together.  The post-stop settling deadline begins only after the matching CS3
+speed-zero confirmation and is conservatively derived from slow-bound travel
+through the full braking-plus-uncertainty envelope; raw calibration rows
+therefore record both stopping distance and observed settle ticks.
+
+The rejected early 2026-07-26 T14/A/speed-20 run is retained in
+`calibration/track_d_physical_runs.csv`: only A1 was observed before the seed
+model commanded zero near C13.  It is evidence that the seed bounds are not a
+T14 calibration, not a replacement velocity constant.  Stage 8 reports this
+case as `STOP_UNCONFIRMED` and preserves the remaining route instead of
+claiming a physical arrival.
+
+A later supervised TC1 measurement on the same date reached A1, C13, and E7.
+Its C13-to-E7 segment measured 39.632 mm/s.  The pickup leading edge finally
+stopped 55 mm beyond E7 after the speed-zero request frame was sent
+44.757 mm beyond E7,
+giving an inferred 10.243 mm command-to-stop distance.  That single run is the
+provisional Stage-8 predictor anchor, not accepted calibration: physical
+settle time was not measured, no repeat exists, and speeds other than 20 are
+extrapolations.  The generic safety envelope remains authoritative until the
+required repeated rows are collected.
+
+The 2026-07-27 Stage-8 physical `caldispatch 14 A 20 d7` run exposed a
+separate envelope-integration error. CAN confirmed the positive-speed
+command, then the sensor service correctly attributed A1 at about 859 ticks
+and C13 at about 1769 ticks after launch. The dispatcher nevertheless charged
+both as spurious and failed closed near C13 because it had reused the narrow
+provisional point-prediction band as a certified maximum-speed sensor bound.
+Stage 9 keeps those concerns separate: the generic conservative fast envelope
+validates whether an ordered sensor occurrence is physically possible, while
+the provisional model is confined to supervised timing deadlines—the point
+stop-command prediction and its fail-closed watchdog. A captured-timing
+regression replays both
+observations, requires zero sensor errors, re-anchors progress at C13 (973 of
+2129 mm), preserves the reservation, and predicts from the remaining 1156 mm
+toward E7 and D7.
+
+The subsequent Stage-9 run in `6.pcapng` reached A1, C13, E7, and physical
+sensor D7 with no route-order error.  It then requested speed zero about
+2.906 ms after the physical D7 report and stopped near that sensor.  Physical
+measurement established that the operator-labelled user endpoint D7 is
+downstream of the sensor, so the run was semantically short and is not
+accepted calibration.  Stage 10 separated the concepts, but its +180 mm run
+still stopped 100 mm before the labelled endpoint.  Stage 11 used a directed
++280 mm endpoint and updated point velocity from every accepted ordered
+sensor interval at every command speed 1..120.  Its predicted speed-zero
+request differed from the actual request by only one 10 ms tick, but the
+settled speed-20 train remained 68 mm before the labelled endpoint.  A later
+physical speed-100 run using the same +280 mm base stopped exactly at the
+labelled endpoint.  Stage 13 therefore kept the physical geometry fixed at
++280 mm and added a first two-point correction.  Subsequent physical tests of
+that version found the settled train 93 mm short at speeds 20/40/60/80,
+4 mm beyond at speed 100, and 240 mm beyond at speed 120.  Stage 14 folded
+those residuals into the six signed correction anchors
++161/+145/+127/+110/-4/-240 mm and piecewise-interpolates every integer speed
+1..120.  A subsequent Stage-14 retest found speeds 20 through 100 acceptable,
+but speed 120 still stopped 180 mm beyond the labelled endpoint.  Stage 15
+therefore leaves all lower anchors unchanged and changes only the speed-120
+anchor to -420 mm.  Two Stage-15 repetitions then both stopped 40 mm beyond
+the labelled endpoint.  Stage 16 keeps every anchor through speed 100 and
+changes only speed 120 to -460 mm.  Speeds 101..120 interpolate to the earlier high-speed
+request; when that request lies before D7 the route uses E7 as its physical
+anchor without changing the user destination or scalar endpoint.  Route cost
+and point deadlines use the effective speed-specific
+endpoint, while collision protection continues to use its independent
+conservative braking envelope.  Because this endpoint crosses a
+turnout boundary,
+a later `CURRENT` command keeps the complete braking/turnout reservation but
+derives its position ambiguity only from the travelled corridor between the
+last trusted sensor and the virtual endpoint.  Adjacent paired-turnout safety
+resources therefore remain protected without being misclassified as possible
+train locations.
+Only this directed D7 base and its six single-run correction anchors have
+physical evidence; the anchors still require repeated runs, and interpolated
+speeds and the other directed sides remain clearly marked provisional.
+
+## Physical Track D verification
+
+Before a graded or unattended run:
+
+1. build and upload the TC2 image using the course AArch64 toolchain;
+2. verify A–F placement/orientation and all d1–d8 labels against the physical
+   layout;
+3. calibrate each train/speed/direction used in the demo and record the raw
+   rows under `calibration/`, including the lowest speed that repeatedly moves
+   without stalling, measured stopping distance, and post-confirmation settle
+   ticks;
+4. run one train at low speed through both sides of every destination and each
+   required reversal;
+5. run two conflicting trips and verify the second remains stopped;
+6. run 3-, 4-, and 6-job epochs with disjoint and conflicting subsets;
+7. inject one intermediate missing report and one non-target spurious report
+   separately and verify the trip succeeds conservatively; inject a second
+   error and verify fail-stop;
+8. verify no turnout changes beneath a train and inspect CAN
+   drop/overflow/timeout counters;
+9. use the emergency stop whenever the physical result differs from the model.
+
+Software tests prove the state-machine and data-structure invariants; only
+these physical checks validate train-specific stopping and real layout
+behavior.
+
+## Stage 33 optimized renderer bound
+
+The sensor-flash pass revalidates every directed sensor's non-negative
+column, positive width, and complete `[column, column + width)` interval
+against the 132-column render frame immediately before writing styles.
+Invalid catalog geometry is skipped without a partial write.  The host
+renderer regression now compiles with `-O3`, matching the optimization level
+that exposed the AArch64 `stringop-overflow` diagnostic.
+
+## Stage 34 target-compiler closure
+
+The directed-sensor catalog stores columns and widths as unsigned bytes.
+Stage 34 removes the invalid signed-negative comparison rejected by the course
+AArch64 compiler under `-O3 -Werror`, promotes both values to `size_t`, and
+checks the complete interval before indexing the style frame.  The runtime,
+post-link gate, build-isolation test, and documentation now share the exact
+Stage 34 marker.  Host `-O3` and sanitizer tests cover the same write site;
+the course AArch64 build remains the final target-toolchain check.
