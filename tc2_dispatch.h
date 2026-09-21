@@ -346,6 +346,16 @@ int Tc2DispatchGetProjectionPage(
         int first_waypoint,
         tc2_dispatch_projection_page *page);
 
+/*
+ * Demo-only turnout relay.  The CAN server accepts turnout commands only
+ * from the registered dispatcher task, so the fixed physical demo asks the
+ * dispatcher to issue and confirm a small atomic batch of up to four
+ * turnouts.  The relay is
+ * rejected while any ordinary dispatch job exists.
+ */
+int Tc2DispatchDemoSwitchBatch(
+        int tid, const int *switches, const char *directions, int count);
+
 void Tc2DispatchServerTask(void);
 void Tc2DispatchTickerTask(void);
 void Tc2DispatchSafetyTask(void);

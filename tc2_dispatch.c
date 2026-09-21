@@ -137,6 +137,7 @@ const char *Tc2DispatchStateName(int state) {
 #define TC2_DISPATCH_MSG_STAGE_CALIBRATION 11
 #define TC2_DISPATCH_MSG_PROJECTION_HEADER 12
 #define TC2_DISPATCH_MSG_PROJECTION_PAGE 13
+#define TC2_DISPATCH_MSG_DEMO_TURNOUT_BATCH 14
 #define TC2_DISPATCH_REQUEST_FORCE_REVERSE_FIRST 0x1u
 #define TC2_DISPATCH_REQUEST_OPERATOR_REROUTE 0x2u
 #define TC2_DISPATCH_REQUEST_STAGE_FLAGS \
@@ -162,13 +163,15 @@ const char *Tc2DispatchStateName(int state) {
 #define TC2_PRECISION_APPROACH_SPEED 20
 #define TC2_DESTINATION_CORRECTION_SPEED 40
 #define TC2_ROLLING_AUTHORITY_MIN_SPEED 40
-#define TC2_POWER_DEAD_ZONE_MIN_SPEED 60
-#define TC2_POWER_DEAD_ZONE_MAX_WINDOWS 4
-#define TC2_POWER_DEAD_ZONE_TURNOUT_3 0
-#define TC2_POWER_DEAD_ZONE_D15_B13 1
 #define TC2_INTERSECTION_RELEASE_MARGIN_MM 200
 #define TC2_AUTHORITY_CAN_BUDGET_TICKS 6
 #define TC2_STARTUP_TURNOUT_TIMEOUT_TICKS 200
+
+enum {
+        TC2_CAN_HEALTH_HARD_FAIL = -1,
+        TC2_CAN_HEALTH_OK = 0,
+        TC2_CAN_HEALTH_RETRY = 1
+};
 
 /*
  * Start every close departure/crossing throat from a known safe setting.
@@ -262,22 +265,6 @@ typedef struct {
                 waypoints[TC2_ROUTE_PROJECTION_MAX_WAYPOINTS];
 } tc2_dispatch_projection_publication;
 
-/*
- * A power-dead zone is physical track, not a train- or destination-specific
- * exception.  Route construction maps each directed occurrence to the real
- * detector immediately before loss of power and the first real detector
- * after power returns.  The ordinary reservation/conflict arbiters remain
- * the exclusive owners; this record only prevents a permitted train from
- * entering that owned interval below the measured crossing speed.
- */
-typedef struct {
-        int physical_id;
-        int entry_route_offset;
-        int exit_route_offset;
-        int entry_distance_mm;
-        int exit_distance_mm;
-} tc2_power_dead_zone_window;
-
 typedef struct {
         track_route route;
         track_route safety_footprint;
@@ -361,11 +348,6 @@ typedef struct {
         int motion_speed_ceiling;
         int speed_reduction_pending;
         int precision_approach_active;
-        int power_dead_zone_window_count;
-        tc2_power_dead_zone_window power_dead_zone_windows[
-                TC2_POWER_DEAD_ZONE_MAX_WINDOWS];
-        int power_dead_zone_override_window;
-        int power_dead_zone_restore_speed;
         int64_t motion_anchor_distance_um;
         int motion_anchor_tick;
         int motion_anchor_from_traffic;
@@ -457,10 +439,22 @@ typedef struct {
          * authoritative and no new route, turnout owner, or switch command may
          * be installed.  direction_locked means the one selected reverse has
          * settled and the next CURRENT plan must start in that new direction.
+         * reverse_pending/direction_locked are physical facts once the reverse
+         * CAN command is acknowledged; they survive request cleanup and are
+         * consumed only when a new directed route commits.
          */
         int retarget_reverse_pending;
         int retarget_reverse_ready_at_tick;
         int retarget_direction_locked;
+        /*
+         * Directed real-sensor pose produced by an acknowledged public
+         * reroute reverse.  This is physical state, not an old-route cursor:
+         * route monitoring may continue to receive events while the reverse
+         * settles, but CURRENT planning must remain pinned to this exact
+         * directed anchor until the replacement route commits.
+         */
+        int retarget_direction_anchor_node;
+        unsigned int retarget_direction_anchor_sequence;
         int head_on_recovery_active;
         int head_on_recovery_cleared;
         /*
@@ -508,6 +502,15 @@ typedef struct {
         int pending_missing_offset;
         int wait_since_tick;
         int ready_wave_tick;
+        /*
+         * Raw journal progress is useful for duplicate accounting, but it is
+         * not localization: duplicate, spurious, and wrong-generation events
+         * also advance last_journal_sequence.  Public CURRENT reroute and its
+         * reverse phase are anchored only to the last detector observation
+         * which actually committed into the route monitor.
+         */
+        int last_accepted_sensor_node;
+        unsigned int last_accepted_sensor_sequence;
         unsigned int last_journal_sequence;
         unsigned int launch_epoch;
         unsigned int queue_sequence;
@@ -658,6 +661,18 @@ static int dispatch_can_tid = -1;
 static int dispatch_sensor_tid = -1;
 static int dispatch_reservation_tid = -1;
 static volatile unsigned int dispatch_heartbeat;
+/*
+ * The notifier heartbeats describe the one CAN controller, not an
+ * individual dispatch job.  Keeping a baseline per train lets a newly
+ * sampled job refresh a controller-wide stall for itself while an older job
+ * observes the same stall as fatal.  One dispatcher-owned baseline gives
+ * every train the same liveness decision on a scheduler tick.
+ */
+static int dispatch_can_heartbeat_valid;
+static unsigned int dispatch_can_tx_heartbeat;
+static unsigned int dispatch_can_rx_heartbeat;
+static int dispatch_can_tx_heartbeat_tick;
+static int dispatch_can_rx_heartbeat_tick;
 
 static int discard_future_conflict_zone_work(int slot);
 static int terminal_static_footprint_committed(int slot);
@@ -695,20 +710,6 @@ static int can_train_move_with_reservation(
 static int command_train_speed_with_retry(int train, int speed);
 static int command_train_positive_speed_with_retry(
         int slot, int speed);
-static int build_power_dead_zone_plan(
-        tc2_dispatch_runtime *runtime, int destination_route_offset);
-static int power_dead_zone_adjusted_speed(
-        int slot, int requested_speed);
-static int power_dead_zone_effective_speed(
-        int slot, int requested_speed);
-static int maintain_power_dead_zone_speed(int slot);
-static int power_dead_zone_authority_ready(
-        int slot,
-        const track_reservation_snapshot *reservation);
-static int power_dead_zone_crossing_active(int slot);
-static int runtime_motion_progress_um(
-        int slot, int now, int64_t *progress_um);
-static int schedule_motion_deadlines(int slot, int now);
 static void fail_launch_wave(unsigned int token, int reason);
 static int stop_partially_confirmed_launch_wave(
         int target_slot, unsigned int launch_token,
@@ -1083,21 +1084,6 @@ static void clear_runtime(tc2_dispatch_runtime *runtime) {
         runtime->motion_speed_ceiling = 0;
         runtime->speed_reduction_pending = 0;
         runtime->precision_approach_active = 0;
-        runtime->power_dead_zone_window_count = 0;
-        for (int index = 0;
-             index < TC2_POWER_DEAD_ZONE_MAX_WINDOWS; ++index) {
-                runtime->power_dead_zone_windows[index].physical_id = -1;
-                runtime->power_dead_zone_windows[index]
-                        .entry_route_offset = -1;
-                runtime->power_dead_zone_windows[index]
-                        .exit_route_offset = -1;
-                runtime->power_dead_zone_windows[index]
-                        .entry_distance_mm = -1;
-                runtime->power_dead_zone_windows[index]
-                        .exit_distance_mm = -1;
-        }
-        runtime->power_dead_zone_override_window = -1;
-        runtime->power_dead_zone_restore_speed = 0;
         runtime->motion_anchor_distance_um = 0;
         runtime->motion_anchor_tick = -1;
         runtime->motion_anchor_from_traffic = 0;
@@ -1142,6 +1128,8 @@ static void clear_runtime(tc2_dispatch_runtime *runtime) {
         runtime->retarget_reverse_pending = 0;
         runtime->retarget_reverse_ready_at_tick = -1;
         runtime->retarget_direction_locked = 0;
+        runtime->retarget_direction_anchor_node = -1;
+        runtime->retarget_direction_anchor_sequence = 0;
         runtime->head_on_recovery_active = 0;
         runtime->head_on_recovery_cleared = 0;
         runtime->prelaunch_traffic_blocked = 0;
@@ -1165,6 +1153,8 @@ static void clear_runtime(tc2_dispatch_runtime *runtime) {
         runtime->pending_missing_offset = -1;
         runtime->wait_since_tick = -1;
         runtime->ready_wave_tick = -1;
+        runtime->last_accepted_sensor_node = -1;
+        runtime->last_accepted_sensor_sequence = 0;
         runtime->last_journal_sequence = 0;
         runtime->launch_epoch = 0;
         runtime->queue_sequence = 0;
@@ -1591,7 +1581,15 @@ static int shift_current_projection_for_preorigin(
                 }
         }
         projection->physical_destination_distance_um += shift_um;
-        for (int waypoint = 0;
+        /*
+         * A live CURRENT projection is always relative to its displayed
+         * start marker, so waypoint zero must remain the canonical
+         * distance-zero START.  The pre-origin carry is physical travel
+         * before every subsequent route event; shifting START as well makes
+         * the otherwise valid reroute publication fail the live-UI payload
+         * invariant and temporarily removes the train from the dashboard.
+         */
+        for (int waypoint = 1;
              waypoint < projection->waypoint_count; ++waypoint) {
                 projection->waypoints[waypoint].distance_um += shift_um;
         }
@@ -2116,6 +2114,29 @@ int Tc2DispatchGetProjectionPage(
         return page->status;
 }
 
+int Tc2DispatchDemoSwitchBatch(
+        int tid, const int *switches, const char *directions, int count) {
+        tc2_dispatch_request request;
+        if (!switches || !directions || count < 1 || count > 4) {
+                return -1;
+        }
+        clear_request(&request, TC2_DISPATCH_MSG_DEMO_TURNOUT_BATCH);
+        request.train = count;
+        request.start_index = switches[0];
+        request.speed = count > 1 ? switches[1] : 0;
+        request.destination_index = count > 2 ? switches[2] : 0;
+        request.node_index = count > 3 ? switches[3] : 0;
+        request.reserved =
+                (uint32_t)(unsigned char)directions[0] |
+                ((uint32_t)(count > 1 ?
+                        (unsigned char)directions[1] : 0) << 8) |
+                ((uint32_t)(count > 2 ?
+                        (unsigned char)directions[2] : 0) << 16) |
+                ((uint32_t)(count > 3 ?
+                        (unsigned char)directions[3] : 0) << 24);
+        return send_request(tid, &request);
+}
+
 static void copy_can_health(tc2_dispatch_job_snapshot *job,
                             const can_health_t *health) {
         job->can_tx_completed = health->tx_completed;
@@ -2129,14 +2150,16 @@ static void copy_can_health(tc2_dispatch_job_snapshot *job,
 static int can_health_is_safe(
         int slot, int establish_baseline, int now) {
         can_health_t health;
-        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
         tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
+        (void)establish_baseline;
         if (now < 0 ||
-            CanGetHealth(dispatch_can_tid, &health) < 0 ||
-            !health.hw_ready) {
-                return -1;
+            CanGetHealth(dispatch_can_tid, &health) < 0) {
+                return TC2_CAN_HEALTH_HARD_FAIL;
         }
         copy_can_health(job, &health);
+        if (!health.hw_ready) {
+                return TC2_CAN_HEALTH_HARD_FAIL;
+        }
         /*
          * Confirmed dispatcher commands are consumed as matching responses
          * and do not increment this counter.  A change here is therefore an
@@ -2145,22 +2168,21 @@ static int can_health_is_safe(
          */
         if (health.turnout_changes !=
             dispatch_unexpected_turnout_changes) {
-                return -1;
+                return TC2_CAN_HEALTH_HARD_FAIL;
         }
-        if (establish_baseline || !runtime->can_baseline_valid) {
-                if (health.tx_notifier_heartbeat == 0 ||
-                    health.rx_notifier_heartbeat == 0) {
-                        return -1;
-                }
-                runtime->can_baseline = health;
-                runtime->can_baseline_valid = 1;
-                runtime->can_tx_heartbeat =
+        if (health.tx_notifier_heartbeat == 0 ||
+            health.rx_notifier_heartbeat == 0) {
+                return TC2_CAN_HEALTH_RETRY;
+        }
+        if (!dispatch_can_heartbeat_valid) {
+                dispatch_can_heartbeat_valid = 1;
+                dispatch_can_tx_heartbeat =
                         health.tx_notifier_heartbeat;
-                runtime->can_rx_heartbeat =
+                dispatch_can_rx_heartbeat =
                         health.rx_notifier_heartbeat;
-                runtime->can_tx_heartbeat_tick = now;
-                runtime->can_rx_heartbeat_tick = now;
-                return 0;
+                dispatch_can_tx_heartbeat_tick = now;
+                dispatch_can_rx_heartbeat_tick = now;
+                return TC2_CAN_HEALTH_OK;
         }
         /*
          * CAN health counters are controller-wide lifetime totals.  They are
@@ -2170,26 +2192,26 @@ static int can_health_is_safe(
          * service liveness remains guarded by the two heartbeat deadlines.
          */
         if (health.tx_notifier_heartbeat !=
-            runtime->can_tx_heartbeat) {
-                runtime->can_tx_heartbeat =
+            dispatch_can_tx_heartbeat) {
+                dispatch_can_tx_heartbeat =
                         health.tx_notifier_heartbeat;
-                runtime->can_tx_heartbeat_tick = now;
+                dispatch_can_tx_heartbeat_tick = now;
         }
         if (health.rx_notifier_heartbeat !=
-            runtime->can_rx_heartbeat) {
-                runtime->can_rx_heartbeat =
+            dispatch_can_rx_heartbeat) {
+                dispatch_can_rx_heartbeat =
                         health.rx_notifier_heartbeat;
-                runtime->can_rx_heartbeat_tick = now;
+                dispatch_can_rx_heartbeat_tick = now;
         }
-        if (runtime->can_tx_heartbeat_tick < 0 ||
-            runtime->can_rx_heartbeat_tick < 0 ||
-            tick_age(now, runtime->can_tx_heartbeat_tick) >
+        if (dispatch_can_tx_heartbeat_tick < 0 ||
+            dispatch_can_rx_heartbeat_tick < 0 ||
+            tick_age(now, dispatch_can_tx_heartbeat_tick) >
                     TC2_SERVICE_HEARTBEAT_MAX_AGE ||
-            tick_age(now, runtime->can_rx_heartbeat_tick) >
+            tick_age(now, dispatch_can_rx_heartbeat_tick) >
                     TC2_SERVICE_HEARTBEAT_MAX_AGE) {
-                return -1;
+                return TC2_CAN_HEALTH_RETRY;
         }
-        return 0;
+        return TC2_CAN_HEALTH_OK;
 }
 
 static int sensor_health_is_safe(
@@ -2243,7 +2265,7 @@ static void fail_job(int slot, int reason) {
          * any further state is exposed.  The physical reservation is
          * deliberately retained below until the normal cancel/remove
          * recovery completes.
-        */
+         */
         invalidate_projection(slot);
         tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
         tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
@@ -2659,493 +2681,6 @@ static int route_distance_to_offset(
         return TrackRouteDistanceBetweenOffsets(
                 dispatch_track, route, 0, offset,
                 distance_mm);
-}
-
-static int append_power_dead_zone_window(
-        tc2_dispatch_runtime *runtime, int physical_id,
-        int entry_offset, int exit_offset) {
-        if (!runtime || !runtime->route_valid ||
-            entry_offset < 0 || exit_offset <= entry_offset ||
-            exit_offset >= runtime->route.node_count ||
-            runtime->power_dead_zone_window_count < 0 ||
-            runtime->power_dead_zone_window_count >=
-                    TC2_POWER_DEAD_ZONE_MAX_WINDOWS) {
-                return -1;
-        }
-
-        for (int index = 0;
-             index < runtime->power_dead_zone_window_count; ++index) {
-                const tc2_power_dead_zone_window *existing =
-                        &runtime->power_dead_zone_windows[index];
-                if (existing->physical_id == physical_id &&
-                    existing->entry_route_offset == entry_offset &&
-                    existing->exit_route_offset == exit_offset) {
-                        return 0;
-                }
-        }
-        int entry_distance;
-        int exit_distance;
-        if (route_distance_to_offset(
-                    &runtime->route, entry_offset,
-                    &entry_distance) < 0 ||
-            route_distance_to_offset(
-                    &runtime->route, exit_offset,
-                    &exit_distance) < 0 ||
-            entry_distance < 0 || exit_distance <= entry_distance) {
-                return -1;
-        }
-
-        int insert = runtime->power_dead_zone_window_count;
-        while (insert > 0 &&
-               runtime->power_dead_zone_windows[insert - 1]
-                               .entry_route_offset > entry_offset) {
-                runtime->power_dead_zone_windows[insert] =
-                        runtime->power_dead_zone_windows[insert - 1];
-                --insert;
-        }
-        tc2_power_dead_zone_window *window =
-                &runtime->power_dead_zone_windows[insert];
-        window->physical_id = physical_id;
-        window->entry_route_offset = entry_offset;
-        window->exit_route_offset = exit_offset;
-        window->entry_distance_mm = entry_distance;
-        window->exit_distance_mm = exit_distance;
-        ++runtime->power_dead_zone_window_count;
-        return 0;
-}
-
-/*
- * Build directed, route-local power windows.  D15--B13 is one measured
- * sensor-to-sensor edge in either direction.  Turnout 3 has three possible
- * legs and no detector between its curved leg and the adjacent turnout-2
- * throat, so its boundaries are derived from the actual route instead of
- * naming one fixed exit.  This also makes reroute/reverse rebuild the correct
- * directed window automatically.
- */
-static int build_power_dead_zone_plan(
-        tc2_dispatch_runtime *runtime,
-        int destination_route_offset) {
-        if (!runtime || !runtime->route_valid ||
-            destination_route_offset < 0 ||
-            destination_route_offset >= runtime->route.node_count) {
-                return -1;
-        }
-        runtime->power_dead_zone_window_count = 0;
-        runtime->power_dead_zone_override_window = -1;
-        runtime->power_dead_zone_restore_speed = 0;
-
-        for (int offset = 0;
-             offset <= destination_route_offset; ++offset) {
-                int node = runtime->route.nodes[offset];
-                if (node < 0 || node >= TRACK_MAX) return -1;
-
-                if (offset < destination_route_offset) {
-                        int next = runtime->route.nodes[offset + 1];
-                        int d15_b13_forward = node == 62 && next == 28;
-                        int d15_b13_reverse = node == 29 && next == 63;
-                        if ((d15_b13_forward || d15_b13_reverse) &&
-                            append_power_dead_zone_window(
-                                    runtime,
-                                    TC2_POWER_DEAD_ZONE_D15_B13,
-                                    offset, offset + 1) < 0) {
-                                return -1;
-                        }
-                }
-
-                int turnout_three =
-                        (dispatch_track[node].type == NODE_BRANCH ||
-                         dispatch_track[node].type == NODE_MERGE) &&
-                        dispatch_track[node].num == 3;
-                if (!turnout_three) continue;
-
-                int entry = offset - 1;
-                while (entry >= 0 &&
-                       dispatch_track[
-                               runtime->route.nodes[entry]].type !=
-                               NODE_SENSOR) {
-                        --entry;
-                }
-                int exit = offset + 1;
-                while (exit <= destination_route_offset &&
-                       dispatch_track[
-                               runtime->route.nodes[exit]].type !=
-                               NODE_SENSOR) {
-                        ++exit;
-                }
-                if (entry < 0 || exit > destination_route_offset ||
-                    append_power_dead_zone_window(
-                            runtime,
-                            TC2_POWER_DEAD_ZONE_TURNOUT_3,
-                            entry, exit) < 0) {
-                        return -1;
-                }
-        }
-        return 0;
-}
-
-/*
- * A movement-authority boundary may be before a power dead zone or safely
- * beyond it, but never inside it.  This is route-derived (and therefore also
- * applies to reroute/reverse) and does not create a second ownership system:
- * SW3 still uses the normal turnout resource and D15--B13 still uses the
- * ordinary node reservation.  The only extra rule is that a window which
- * lets the train centre enter must also own a speed-60 stopping envelope on
- * powered track beyond the exit detector.
- */
-static int authority_window_clears_power_dead_zones(
-        const track_route *route, int first_motion_offset,
-        int authority_end_offset, int destination_route_offset,
-        int authority_center_ceiling_mm) {
-        if (!route || first_motion_offset < 0 ||
-            authority_end_offset < first_motion_offset ||
-            destination_route_offset < authority_end_offset ||
-            destination_route_offset >= route->node_count ||
-            authority_center_ceiling_mm < 0) {
-                return -1;
-        }
-        int braking = Tc2MotionBrakingDistanceMm(
-                TC2_POWER_DEAD_ZONE_MIN_SPEED);
-        if (braking < 0) return -1;
-
-        for (int offset = 0;
-             offset <= destination_route_offset; ++offset) {
-                int node = route->nodes[offset];
-                if (node < 0 || node >= TRACK_MAX) return -1;
-                int entry = -1;
-                int exit = -1;
-
-                if (offset < destination_route_offset) {
-                        int next = route->nodes[offset + 1];
-                        if ((node == 62 && next == 28) ||
-                            (node == 29 && next == 63)) {
-                                entry = offset;
-                                exit = offset + 1;
-                        }
-                }
-                if ((dispatch_track[node].type == NODE_BRANCH ||
-                     dispatch_track[node].type == NODE_MERGE) &&
-                    dispatch_track[node].num == 3) {
-                        entry = offset - 1;
-                        while (entry >= 0 &&
-                               dispatch_track[
-                                       route->nodes[entry]].type !=
-                                       NODE_SENSOR) {
-                                --entry;
-                        }
-                        exit = offset + 1;
-                        while (exit <= destination_route_offset &&
-                               dispatch_track[
-                                       route->nodes[exit]].type !=
-                                       NODE_SENSOR) {
-                                ++exit;
-                        }
-                }
-                if (entry < 0 || exit <= entry ||
-                    exit > destination_route_offset ||
-                    exit < first_motion_offset) {
-                        continue;
-                }
-
-                int entry_distance = -1;
-                int exit_distance = -1;
-                if (route_distance_to_offset(
-                            route, entry, &entry_distance) < 0 ||
-                    route_distance_to_offset(
-                            route, exit, &exit_distance) < 0 ||
-                    entry_distance < 0 ||
-                    exit_distance <= entry_distance) {
-                        return -1;
-                }
-                /* This authority stops on powered track before the entry. */
-                if (authority_center_ceiling_mm < entry_distance) {
-                        continue;
-                }
-                if (authority_end_offset < exit ||
-                    (int64_t)authority_center_ceiling_mm <
-                            (int64_t)exit_distance + braking) {
-                        return 0;
-                }
-        }
-        return 1;
-}
-
-static int power_dead_zone_progress_um(
-        int slot, int64_t *progress_um) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS ||
-            !progress_um) {
-                return -1;
-        }
-        const tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
-        const tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        int64_t progress = job->confirmed_distance_mm >= 0 ?
-                (int64_t)job->confirmed_distance_mm * 1000 : 0;
-        if (job->estimated_distance_um > progress) {
-                progress = job->estimated_distance_um;
-        }
-        int now = Time();
-        int64_t moving_progress;
-        if (now >= 0 && runtime->command_speed > 0 &&
-            runtime_motion_progress_um(
-                    slot, now, &moving_progress) == 0 &&
-            moving_progress > progress) {
-                progress = moving_progress;
-        }
-        *progress_um = progress;
-        return 0;
-}
-
-static int current_power_dead_zone_window(int slot) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS) return -1;
-        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        int confirmed = runtime->monitor.confirmed_offset;
-        int64_t progress_um;
-        if (!runtime->route_valid || confirmed < 0 ||
-            confirmed >= runtime->route.node_count ||
-            power_dead_zone_progress_um(slot, &progress_um) < 0) {
-                return -1;
-        }
-        for (int index = 0;
-             index < runtime->power_dead_zone_window_count; ++index) {
-                const tc2_power_dead_zone_window *window =
-                        &runtime->power_dead_zone_windows[index];
-                if (confirmed < window->exit_route_offset &&
-                    (confirmed >= window->entry_route_offset ||
-                     progress_um >=
-                            (int64_t)window->entry_distance_mm * 1000)) {
-                        return index;
-                }
-        }
-        return -1;
-}
-
-/*
- * Admission begins one stopping envelope before the entry boundary.  This is
- * deliberately earlier than the speed-floor transition: if the entry
- * detector is the one tolerated missing report, the train still stops on
- * powered track unless the complete exit window has already committed.
- */
-static int approaching_power_dead_zone_window(int slot) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS) return -1;
-        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        int confirmed = runtime->monitor.confirmed_offset;
-        int64_t progress_um;
-        int admission_speed = runtime->command_speed;
-        if (runtime->motion_speed_ceiling > admission_speed) {
-                admission_speed = runtime->motion_speed_ceiling;
-        }
-        if (admission_speed <= 0) {
-                admission_speed = runtime->planned_launch_speed;
-        }
-        if (admission_speed <= 0) {
-                admission_speed = dispatch_jobs[slot].speed;
-        }
-        if (admission_speed > 0 &&
-            admission_speed < TC2_POWER_DEAD_ZONE_MIN_SPEED) {
-                admission_speed = TC2_POWER_DEAD_ZONE_MIN_SPEED;
-        }
-        int braking_mm = admission_speed > 0 && admission_speed <= 120 ?
-                Tc2MotionBrakingDistanceMm(admission_speed) : -1;
-        if (!runtime->route_valid || confirmed < 0 ||
-            power_dead_zone_progress_um(slot, &progress_um) < 0 ||
-            braking_mm < 0) {
-                return -1;
-        }
-        for (int index = 0;
-             index < runtime->power_dead_zone_window_count; ++index) {
-                const tc2_power_dead_zone_window *window =
-                        &runtime->power_dead_zone_windows[index];
-                if (confirmed >= window->exit_route_offset) continue;
-                if (confirmed >= window->entry_route_offset ||
-                    progress_um + (int64_t)braking_mm * 1000 >=
-                            (int64_t)window->entry_distance_mm * 1000) {
-                        return index;
-                }
-        }
-        return -1;
-}
-
-static int power_dead_zone_crossing_active(int slot) {
-        return current_power_dead_zone_window(slot) >= 0;
-}
-
-/*
- * Entering a dead zone is allowed only when this train already owns the
- * complete directed interval and can coast/stop on powered track beyond its
- * exit.  The reservation generation, next/nextnext ownership, switch
- * settling and all-train safety remain mandatory in can_train_move().
- */
-static int power_dead_zone_authority_ready(
-        int slot,
-        const track_reservation_snapshot *reservation) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS ||
-            !reservation) {
-                return 0;
-        }
-        int index = approaching_power_dead_zone_window(slot);
-        if (index < 0) return 1;
-        const tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
-        const tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        const tc2_power_dead_zone_window *window =
-                &runtime->power_dead_zone_windows[index];
-        int braking = Tc2MotionBrakingDistanceMm(
-                TC2_POWER_DEAD_ZONE_MIN_SPEED);
-        if (braking < 0 || runtime->authority_end_offset <
-                            window->exit_route_offset ||
-            (int64_t)runtime->authority_center_ceiling_mm <
-                    (int64_t)window->exit_distance_mm + braking ||
-            job->destination_distance_mm <
-                    window->exit_distance_mm) {
-                return 0;
-        }
-        for (int offset = window->entry_route_offset;
-             offset <= window->exit_route_offset; ++offset) {
-                int node = runtime->route.nodes[offset];
-                if (node < 0 || node >= TRACK_MAX) return 0;
-                int reverse = physical_reverse_index(node);
-                if (reservation->owner_by_node[node] != job->train ||
-                    (reverse >= 0 &&
-                     reservation->owner_by_node[reverse] != job->train)) {
-                        return 0;
-                }
-        }
-        return 1;
-}
-
-static int power_dead_zone_adjusted_speed(
-        int slot, int requested_speed) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS ||
-            requested_speed < 1 || requested_speed > 120) {
-                return -1;
-        }
-        int index = approaching_power_dead_zone_window(slot);
-        if (index < 0 ||
-            requested_speed >= TC2_POWER_DEAD_ZONE_MIN_SPEED) {
-                return requested_speed;
-        }
-        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        /*
-         * The most recent low-speed intent wins.  A precision stage may be
-         * requested while an earlier 40->60 crossing override is already
-         * active; keeping the first value would restore the obsolete speed
-         * after the exit detector.
-         */
-        runtime->power_dead_zone_override_window = index;
-        runtime->power_dead_zone_restore_speed = requested_speed;
-        return TC2_POWER_DEAD_ZONE_MIN_SPEED;
-}
-
-/*
- * Safety and authority calculations must use the command that will actually
- * be sent at a dead-zone approach.  Keep this separate from
- * traffic_effective_speed(): approaching_power_dead_zone_window() needs a
- * braking envelope of its own and must not recurse through traffic policy.
- */
-static int power_dead_zone_effective_speed(
-        int slot, int requested_speed) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS ||
-            requested_speed < 0 || requested_speed > 120) {
-                return -1;
-        }
-        if (requested_speed > 0 &&
-            requested_speed < TC2_POWER_DEAD_ZONE_MIN_SPEED &&
-            approaching_power_dead_zone_window(slot) >= 0) {
-                return TC2_POWER_DEAD_ZONE_MIN_SPEED;
-        }
-        return requested_speed;
-}
-
-/*
- * A train can enter a window long after its original launch command.  Raise a
- * low correction/approach command at the entry detector, then restore that
- * exact command only after the exit detector is confirmed.  Normal speed-80
- * traffic is untouched.
- */
-static int maintain_power_dead_zone_speed(int slot) {
-        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS) return -1;
-        tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
-        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
-        int approaching = approaching_power_dead_zone_window(slot);
-
-        if (approaching >= 0 && runtime->command_speed > 0) {
-                int crossing_speed = power_dead_zone_adjusted_speed(
-                        slot, runtime->command_speed);
-                if (crossing_speed < 0) return -1;
-                if (crossing_speed == runtime->command_speed) return 0;
-                int command = command_train_positive_speed_with_retry(
-                        slot, crossing_speed);
-                if (command != 0) return command;
-                int confirmed = Time();
-                int64_t progress_um;
-                if (confirmed < 0 ||
-                    runtime_motion_progress_um(
-                            slot, confirmed, &progress_um) < 0 ||
-                    progress_um < 0) {
-                        return -1;
-                }
-                runtime->motion_anchor_distance_um = progress_um;
-                runtime->motion_anchor_tick = confirmed;
-                runtime->motion_anchor_from_traffic = 0;
-                runtime->command_speed = crossing_speed;
-                if (runtime->motion_speed_ceiling < crossing_speed) {
-                        runtime->motion_speed_ceiling = crossing_speed;
-                }
-                runtime->speed_reduction_pending = 0;
-                runtime->observed_velocity_um_per_tick = -1;
-                job->command_speed = crossing_speed;
-                if (job->estimated_distance_um < progress_um) {
-                        job->estimated_distance_um = progress_um;
-                }
-                if (!runtime->destination_correction_active &&
-                    schedule_motion_deadlines(slot, confirmed) < 0) {
-                        return -1;
-                }
-                return 0;
-        }
-
-        int override = runtime->power_dead_zone_override_window;
-        if (override < 0 ||
-            override >= runtime->power_dead_zone_window_count) {
-                return 0;
-        }
-        const tc2_power_dead_zone_window *window =
-                &runtime->power_dead_zone_windows[override];
-        if (runtime->monitor.confirmed_offset <
-                    window->exit_route_offset ||
-            runtime->command_speed <= 0) {
-                return 0;
-        }
-        int restore = runtime->power_dead_zone_restore_speed;
-        if (restore < 1 || restore > 120) return -1;
-        if (restore != runtime->command_speed) {
-                int command = command_train_positive_speed_with_retry(
-                        slot, restore);
-                if (command != 0) return command;
-                int confirmed = Time();
-                int64_t progress_um;
-                if (confirmed < 0 ||
-                    runtime_motion_progress_um(
-                            slot, confirmed, &progress_um) < 0 ||
-                    progress_um < 0) {
-                        return -1;
-                }
-                runtime->motion_anchor_distance_um = progress_um;
-                runtime->motion_anchor_tick = confirmed;
-                runtime->motion_anchor_from_traffic = 0;
-                runtime->command_speed = restore;
-                runtime->speed_reduction_pending = 1;
-                runtime->observed_velocity_um_per_tick = -1;
-                job->command_speed = restore;
-                if (job->estimated_distance_um < progress_um) {
-                        job->estimated_distance_um = progress_um;
-                }
-                if (!runtime->destination_correction_active &&
-                    schedule_motion_deadlines(slot, confirmed) < 0) {
-                        return -1;
-                }
-        }
-        runtime->power_dead_zone_override_window = -1;
-        runtime->power_dead_zone_restore_speed = 0;
-        return 0;
 }
 
 static int footprint_tail_offset_for_anchor(
@@ -3599,14 +3134,6 @@ static int select_rolling_authority_window_for_leg(
                                 return -1;
                         }
                 }
-                int dead_zone_safe =
-                        authority_window_clears_power_dead_zones(
-                                route, first_motion_offset,
-                                footprint_end,
-                                destination_route_offset,
-                                ceiling);
-                if (dead_zone_safe < 0) return -1;
-                if (!dead_zone_safe) continue;
                 track_reservation_conflict candidate_conflict;
                 int available =
                         authority_footprint_available(
@@ -3888,40 +3415,6 @@ static int select_initial_next_zone_window(
                 return 2;
         }
 
-        int boundary_margin =
-                (TC2_TRAIN_BODY_MM + 1) / 2 +
-                TC2_INTERSECTION_RELEASE_MARGIN_MM;
-        int ceiling = -1;
-        int safe_end = -1;
-        for (int candidate_end = end;
-             candidate_end <= destination_route_offset;
-             ++candidate_end) {
-                int end_distance = -1;
-                if (route_distance_to_offset(
-                            route, candidate_end,
-                            &end_distance) < 0 ||
-                    end_distance < 0) {
-                        return -1;
-                }
-                int candidate_ceiling =
-                        end_distance > boundary_margin ?
-                        end_distance - boundary_margin : 0;
-                int dead_zone_safe =
-                        authority_window_clears_power_dead_zones(
-                                route, first_motion_offset,
-                                candidate_end,
-                                destination_route_offset,
-                                candidate_ceiling);
-                if (dead_zone_safe < 0) return -1;
-                if (dead_zone_safe) {
-                        safe_end = candidate_end;
-                        ceiling = candidate_ceiling;
-                        break;
-                }
-        }
-        if (safe_end < 0 || ceiling < 0) return 2;
-        end = safe_end;
-
         if (build_local_authority_footprint(
                     route, first_motion_offset, end,
                     motion_leg_start_offset,
@@ -3933,8 +3426,18 @@ static int select_initial_next_zone_window(
                 selected, train, reservation, sensors, conflict);
         if (available != 0) return available < 0 ? -1 : 1;
 
+        int end_distance = -1;
+        int boundary_margin =
+                (TC2_TRAIN_BODY_MM + 1) / 2 +
+                TC2_INTERSECTION_RELEASE_MARGIN_MM;
+        if (route_distance_to_offset(route, end, &end_distance) < 0 ||
+            end_distance < 0) {
+                return -1;
+        }
         *selected_end_offset = end;
-        *selected_center_ceiling_mm = ceiling;
+        *selected_center_ceiling_mm =
+                end_distance > boundary_margin ?
+                end_distance - boundary_margin : 0;
         if (conflict) {
                 conflict->node_index = -1;
                 conflict->owner_train = 0;
@@ -5525,11 +5028,12 @@ static int candidate_route_for_current_hold(
         } else if (select_lowest_cost_direction) {
                 /*
                  * Reroute has no implicit direction command.  Compare every
-                 * independently validated CURRENT alternative and select the
-                 * least-cost one (then the shorter physical route).  Starting
-                 * from forward preserves direction on an exact tie; a leading
-                 * reverse wins only when it is genuinely the better route to
-                 * a destination behind the stopped train.
+                 * independently validated CURRENT alternative by physical
+                 * travel first, using optimization cost only as the tie
+                 * breaker.  A reversal penalty is useful when two routes
+                 * cover the same distance, but it must not send a train all
+                 * the way around the layout past the nearby destination-side
+                 * detector merely to avoid one safe reverse.
                  */
                 int selected_cost = 0;
                 int selected_distance = 0;
@@ -5544,9 +5048,10 @@ static int candidate_route_for_current_hold(
                         selected = 1;
                 }
                 if (have_reversal &&
-                    (!selected || reversal_cost < selected_cost ||
-                     (reversal_cost == selected_cost &&
-                      reversal_distance < selected_distance))) {
+                    (!selected ||
+                     reversal_distance < selected_distance ||
+                     (reversal_distance == selected_distance &&
+                      reversal_cost < selected_cost))) {
                         *route = reversal;
                         *target_offset = reversal_target;
                         *destination_route_offset =
@@ -5556,9 +5061,10 @@ static int candidate_route_for_current_hold(
                         selected = 1;
                 }
                 if (have_leading &&
-                    (!selected || leading_cost < selected_cost ||
-                     (leading_cost == selected_cost &&
-                      leading_distance < selected_distance))) {
+                    (!selected ||
+                     leading_distance < selected_distance ||
+                     (leading_distance == selected_distance &&
+                      leading_cost < selected_cost))) {
                         *route = leading;
                         *target_offset = leading_target;
                         *destination_route_offset =
@@ -5919,9 +5425,10 @@ static int choose_shortest_available_route(
                 }
                 int candidate_is_better =
                         runtime->reroute_select_direction ?
-                        (!found || candidate_cost < selected_cost ||
-                         (candidate_cost == selected_cost &&
-                          candidate_distance < *path_distance)) :
+                        (!found ||
+                         candidate_distance < *path_distance ||
+                         (candidate_distance == *path_distance &&
+                          candidate_cost < selected_cost)) :
                         (!found || candidate_distance < *path_distance ||
                          (candidate_distance == *path_distance &&
                           candidate_cost < selected_cost));
@@ -6144,7 +5651,8 @@ static int stage_job(const tc2_dispatch_request *request) {
               request->start_index != 0 ||
               request->destination_index != 6 ||
               has_any_job())) ||
-            (!provisional && has_provisional_job())) {
+            (!provisional && !operator_reroute &&
+             has_provisional_job())) {
                 return -1;
         }
         int slot = find_train_job(request->train);
@@ -6164,12 +5672,28 @@ static int stage_job(const tc2_dispatch_request *request) {
                     dispatch_jobs[slot].state == TC2_JOB_EMPTY ||
                     dispatch_runtime[slot]
                                     .lifecycle_stop_reason ==
-                            TC2_LIFECYCLE_STOP_REMOVE_PENDING ||
-                    dispatch_runtime[slot].retarget_armed) {
+                            TC2_LIFECYCLE_STOP_REMOVE_PENDING) {
                         return -1;
                 }
                 tc2_dispatch_runtime *runtime =
                         &dispatch_runtime[slot];
+                /*
+                 * A newer operator request supersedes any older staged or
+                 * armed destination.  Do not, however, forget a physical
+                 * reverse which has already been sent: its settle deadline
+                 * and resulting direction are facts about the train, not
+                 * future authority owned by the old route.
+                 */
+                int reverse_pending =
+                        runtime->retarget_reverse_pending;
+                int reverse_ready_at_tick =
+                        runtime->retarget_reverse_ready_at_tick;
+                int direction_locked =
+                        runtime->retarget_direction_locked;
+                int direction_anchor_node =
+                        runtime->retarget_direction_anchor_node;
+                unsigned int direction_anchor_sequence =
+                        runtime->retarget_direction_anchor_sequence;
                 runtime->retarget_pending = 1;
                 runtime->retarget_armed = 0;
                 runtime->retarget_speed = request->speed;
@@ -6183,9 +5707,14 @@ static int stage_job(const tc2_dispatch_request *request) {
                 runtime->retarget_launch_epoch = 0;
                 runtime->retarget_force_reverse_first = 0;
                 runtime->retarget_operator_reroute = 1;
-                runtime->retarget_reverse_pending = 0;
-                runtime->retarget_reverse_ready_at_tick = -1;
-                runtime->retarget_direction_locked = 0;
+                runtime->retarget_reverse_pending = reverse_pending;
+                runtime->retarget_reverse_ready_at_tick =
+                        reverse_pending ? reverse_ready_at_tick : -1;
+                runtime->retarget_direction_locked = direction_locked;
+                runtime->retarget_direction_anchor_node =
+                        direction_anchor_node;
+                runtime->retarget_direction_anchor_sequence =
+                        direction_anchor_sequence;
                 return 0;
         }
         int current_node = -1;
@@ -6204,6 +5733,8 @@ static int stage_job(const tc2_dispatch_request *request) {
         int carry_motion_origin_offset = -1;
         int carry_preorigin_distance_mm = 0;
         int carry_head_on_recovery = 0;
+        int carry_last_accepted_sensor_node = -1;
+        unsigned int carry_last_accepted_sensor_sequence = 0;
         int current_from_arrived = 0;
         int current_from_cancelled_block = 0;
         int carry_conflict_zone_count = 0;
@@ -6278,6 +5809,8 @@ static int stage_job(const tc2_dispatch_request *request) {
                 held_runtime->retarget_reverse_pending = 0;
                 held_runtime->retarget_reverse_ready_at_tick = -1;
                 held_runtime->retarget_direction_locked = 0;
+                held_runtime->retarget_direction_anchor_node = -1;
+                held_runtime->retarget_direction_anchor_sequence = 0;
                 return 0;
         }
         if (request->start_index == TC2_DISPATCH_START_CURRENT) {
@@ -6370,6 +5903,10 @@ static int stage_job(const tc2_dispatch_request *request) {
                 carry_ambiguity_active = 1;
                 tc2_dispatch_runtime *old_runtime =
                         &dispatch_runtime[slot];
+                carry_last_accepted_sensor_node =
+                        old_runtime->last_accepted_sensor_node;
+                carry_last_accepted_sensor_sequence =
+                        old_runtime->last_accepted_sensor_sequence;
                 /*
                  * Preserve physical ownership before clear_runtime() erases
                  * the old route geometry.  This is bookkeeping only: no
@@ -6660,6 +6197,17 @@ static int stage_job(const tc2_dispatch_request *request) {
                 dispatch_runtime[slot]
                         .stage_sensor_baseline_valid =
                         stage_sensor_baseline_valid;
+                /*
+                 * CURRENT replacement retires an old movement plan, not the
+                 * physical localization evidence which made that replacement
+                 * safe.  Raw journal sequence is deliberately not carried:
+                 * only the last detector observation accepted by the old
+                 * monitor may anchor a public reroute or one physical reverse.
+                 */
+                dispatch_runtime[slot].last_accepted_sensor_node =
+                        carry_last_accepted_sensor_node;
+                dispatch_runtime[slot].last_accepted_sensor_sequence =
+                        carry_last_accepted_sensor_sequence;
         }
         if (carry_ambiguity_active) {
                 dispatch_runtime[slot].carry_ambiguity_footprint =
@@ -6812,8 +6360,32 @@ static int init_leg_monitor(int slot, unsigned int baseline_sequence) {
                 return -1;
         }
         runtime->last_journal_sequence = baseline_sequence;
-        runtime->target_seen = 0;
-        runtime->target_corroborated = 0;
+        /*
+         * A CURRENT plan begins at the latest confirmed real detector.  If
+         * that physical detector is also the selected destination anchor,
+         * its event was necessarily consumed before this new monitor was
+         * created and cannot be expected a second time.  Carry that real
+         * evidence into the new generation so a reroute from A15/A16 toward
+         * d1 starts the remaining bounded endpoint approach instead of
+         * chasing the opposite-side A11/A12 detector.  Directed halves of
+         * one detector are intentionally equivalent here; route direction
+         * and turnout authority remain enforced independently.
+         */
+        int origin_node =
+                runtime->route.nodes[runtime->leg_start_offset];
+        int target_at_confirmed_current_origin =
+                job->start_index == TC2_DISPATCH_START_CURRENT &&
+                !runtime->localization_only &&
+                job->destination_offset_mm > 0 &&
+                job->target_route_offset ==
+                        runtime->leg_start_offset &&
+                (origin_node == job->target_node ||
+                 physical_reverse_index(origin_node) ==
+                        job->target_node);
+        runtime->target_seen =
+                target_at_confirmed_current_origin;
+        runtime->target_corroborated =
+                target_at_confirmed_current_origin;
         runtime->reservation_anchor_offset =
                 runtime->leg_start_offset;
         runtime->pending_missing_offset = -1;
@@ -6955,6 +6527,22 @@ static int uses_exact_destination_sensor_stop(
 }
 
 /*
+ * d3 and d8 are bounded by a real detector on either physical approach. Treat
+ * the first directed report from that selected boundary as terminal evidence:
+ * once the locomotive has crossed the detector it must remain at speed zero,
+ * rather than starting a second speed-40 virtual-offset approach.  Keep this
+ * separate from uses_exact_destination_sensor_stop(); their catalogue offsets
+ * are non-zero and must not relax the ordinary pre-sensor braking-anchor rule.
+ */
+static int destination_boundary_sensor_ends_trip(
+        const tc2_dispatch_job_snapshot *job) {
+        return uses_exact_destination_sensor_stop(job) ||
+                (uses_measured_direct_stop(job) &&
+                 (job->destination_index == 2 ||
+                  job->destination_index == 7));
+}
+
+/*
  * Keep physical endpoint calibration separate from the conservative traffic
  * envelope.  After rolling-authority/traffic scheduling was enabled, the
  * latest Track-D runs of T14 from fixed bay A established a common command-100
@@ -7057,11 +6645,7 @@ static int reduce_for_anchor_stage(
 
         if (reduced > job->speed) reduced = job->speed;
         if (reduced < 1) return -1;
-        reduced = power_dead_zone_adjusted_speed(slot, reduced);
-        if (reduced < 1) return -1;
         if (runtime->command_speed == reduced) {
-                runtime->speed_reduction_pending = 1;
-                runtime->precision_approach_active = 1;
                 job->command_speed = reduced;
                 return 0;
         }
@@ -7432,15 +7016,11 @@ static int destination_final_braking_anchor_confirmed(
 }
 
 /*
- * A lowercase destination is described from both physical approaches.  The
- * two catalog entries are localization boundaries around the same operator
- * endpoint; they are not two independent destinations.  Match physical
- * sensor pairs here so a directed report (for example E5 versus E6) is not
- * rejected merely because the route stores the reverse-directed node.
- *
- * The returned bits name every matching catalog side.  Zero-offset
- * destinations legitimately have both bits set because their two directed
- * anchors are the same physical detector.
+ * A lowercase destination is described from both physical approaches.
+ * Match the physical sensor pair as well as the directed node stored in the
+ * route.  Callers deliberately treat this as terminal evidence only for a
+ * zero-offset endpoint; non-coincident endpoints retain their ordinary
+ * sensor-anchor-plus-distance correction.
  */
 static unsigned int destination_boundary_sensor_mask(
         int slot, int sensor_node) {
@@ -7477,6 +7057,27 @@ static unsigned int destination_boundary_sensor_mask(
         return mask;
 }
 
+/*
+ * Return the physical approach side represented by either directed report
+ * from one of the destination's two boundary detectors.  The route planner
+ * normally selects the correct side up front, but a real detector report is
+ * stronger evidence than that provisional choice.  In particular, a train
+ * which reaches C15 on the way to d8, E9/D6 on the way to d7, or either d2
+ * boundary must finish from that observed boundary; it must never continue
+ * through the lowercase endpoint merely to chase the opposite-side sensor.
+ */
+static int destination_boundary_side_for_sensor(
+        int slot, int sensor_node) {
+        unsigned int mask =
+                destination_boundary_sensor_mask(slot, sensor_node);
+        if (mask == 0) return -1;
+        for (int side = 0;
+             side < TC2_TRACK_DESTINATION_SIDE_COUNT; ++side) {
+                if (mask & (1u << side)) return side;
+        }
+        return -1;
+}
+
 static int destination_direct_stop_waits_for_real_anchor(
         int slot, int64_t zero_command_distance_um,
         int *anchor_offset) {
@@ -7486,21 +7087,6 @@ static int destination_direct_stop_waits_for_real_anchor(
                         slot, zero_command_distance_um,
                         anchor_offset);
         if (anchor_ready < 0) return -1;
-        /*
-         * If either catalogued approach boundary has already reported, the
-         * controller has stronger real-position evidence than the one
-         * route-local braking anchor selected above.  Do not continue solely
-         * to obtain that particular sensor.  The selected-side boundary may
-         * still leave a scalar tail for the bounded speed-40 correction; an
-         * opposite-side boundary is stopped immediately in the observation
-         * path below.
-         */
-        if (destination_boundary_sensor_mask(
-                    slot, dispatch_jobs[slot].current_node) != 0) {
-                *anchor_offset =
-                        dispatch_jobs[slot].current_route_offset;
-                return 0;
-        }
         /*
          * d5/d6 are detector-centre destinations.  Waiting for the target
          * detector before issuing the first zero would necessarily carry the
@@ -10229,6 +9815,45 @@ static int terminal_static_footprint_committed(int slot) {
 static void retire_future_control_fields(
         tc2_dispatch_runtime *runtime) {
         if (!runtime) return;
+        /*
+         * A public CURRENT reroute is a new operator command, not authority
+         * belonging to the route being retired.  A train can arrive, fail
+         * closed, or finish a cancel between `reroute` and `go`; terminal
+         * cleanup must still discard every old next/nextnext owner without
+         * silently deleting that newer command.  cancel_job() deliberately
+         * clears retarget_pending before calling here, so an explicit cancel
+         * still cancels an uncommitted reroute as expected.
+         */
+        int preserve_operator_retarget =
+                runtime->retarget_pending &&
+                runtime->retarget_operator_reroute;
+        int preserve_physical_reverse =
+                runtime->retarget_reverse_pending ||
+                runtime->retarget_direction_locked;
+        int saved_retarget_armed = runtime->retarget_armed;
+        int saved_retarget_speed = runtime->retarget_speed;
+        int saved_retarget_destination =
+                runtime->retarget_destination_index;
+        unsigned int saved_retarget_expected_generation =
+                runtime->retarget_expected_generation;
+        int saved_retarget_expected_destination =
+                runtime->retarget_expected_destination;
+        unsigned int saved_retarget_queue_sequence =
+                runtime->retarget_queue_sequence;
+        unsigned int saved_retarget_launch_epoch =
+                runtime->retarget_launch_epoch;
+        int saved_retarget_force_reverse_first =
+                runtime->retarget_force_reverse_first;
+        int saved_retarget_reverse_pending =
+                runtime->retarget_reverse_pending;
+        int saved_retarget_reverse_ready_at_tick =
+                runtime->retarget_reverse_ready_at_tick;
+        int saved_retarget_direction_locked =
+                runtime->retarget_direction_locked;
+        int saved_retarget_direction_anchor_node =
+                runtime->retarget_direction_anchor_node;
+        unsigned int saved_retarget_direction_anchor_sequence =
+                runtime->retarget_direction_anchor_sequence;
         runtime->movement_plan_active = 0;
         runtime->planned_launch_speed = 0;
         runtime->rolling_authority_active = 0;
@@ -10262,16 +9887,54 @@ static void retire_future_control_fields(
         runtime->retarget_reverse_pending = 0;
         runtime->retarget_reverse_ready_at_tick = -1;
         runtime->retarget_direction_locked = 0;
+        runtime->retarget_direction_anchor_node = -1;
+        runtime->retarget_direction_anchor_sequence = 0;
         runtime->destination_correction_active = 0;
         runtime->destination_correction_pending = 0;
         runtime->destination_correction_attempted = 0;
         runtime->destination_correction_deadline_tick = -1;
         runtime->destination_correction_sensor_offset = -1;
         runtime->destination_correction_reached_endpoint = 0;
-        runtime->power_dead_zone_window_count = 0;
-        runtime->power_dead_zone_override_window = -1;
-        runtime->power_dead_zone_restore_speed = 0;
         runtime->prelaunch_traffic_blocked = 0;
+        if (preserve_operator_retarget) {
+                runtime->retarget_pending = 1;
+                runtime->retarget_armed = saved_retarget_armed;
+                runtime->retarget_speed = saved_retarget_speed;
+                runtime->retarget_destination_index =
+                        saved_retarget_destination;
+                runtime->retarget_expected_generation =
+                        saved_retarget_expected_generation;
+                runtime->retarget_expected_destination =
+                        saved_retarget_expected_destination;
+                runtime->retarget_queue_sequence =
+                        saved_retarget_queue_sequence;
+                runtime->retarget_launch_epoch =
+                        saved_retarget_launch_epoch;
+                runtime->retarget_force_reverse_first =
+                        saved_retarget_force_reverse_first;
+                runtime->retarget_operator_reroute = 1;
+                runtime->retarget_reverse_pending =
+                        saved_retarget_reverse_pending;
+                runtime->retarget_reverse_ready_at_tick =
+                        saved_retarget_reverse_ready_at_tick;
+                runtime->retarget_direction_locked =
+                        saved_retarget_direction_locked;
+                runtime->retarget_direction_anchor_node =
+                        saved_retarget_direction_anchor_node;
+                runtime->retarget_direction_anchor_sequence =
+                        saved_retarget_direction_anchor_sequence;
+        } else if (preserve_physical_reverse) {
+                runtime->retarget_reverse_pending =
+                        saved_retarget_reverse_pending;
+                runtime->retarget_reverse_ready_at_tick =
+                        saved_retarget_reverse_ready_at_tick;
+                runtime->retarget_direction_locked =
+                        saved_retarget_direction_locked;
+                runtime->retarget_direction_anchor_node =
+                        saved_retarget_direction_anchor_node;
+                runtime->retarget_direction_anchor_sequence =
+                        saved_retarget_direction_anchor_sequence;
+        }
 }
 
 /*
@@ -10954,6 +10617,10 @@ static int process_conflict_zone_carries(int slot, int now) {
                 job->current_node < TRACK_MAX &&
                 conflict_zone_physical_distances_from(
                         job->current_node, distance) == 0;
+        int64_t progress_lower_um = 0;
+        int have_motion_lower_bound =
+                runtime_conflict_zone_progress_lower_bound_um(
+                        slot, now, &progress_lower_um) == 0;
         int index = 0;
         while (index < runtime->conflict_zone_carry_count) {
                 if (!conflict_zone_carry_is_cohort_first(runtime, index)) {
@@ -11029,7 +10696,29 @@ static int process_conflict_zone_carries(int slot, int now) {
                                         TC2_TRAIN_HALF_LENGTH_MM + 20 &&
                                 distance[exit] >
                                         TC2_TRAIN_HALF_LENGTH_MM + 20;
-                        int clear = scalar_clear || graph_clear;
+                        /*
+                         * Missing the first detector after a turnout must
+                         * not leave this train's old ticket blocking a later
+                         * occurrence of that same physical resource forever.
+                         * This lower bound is uncertainty-discounted and is
+                         * never earlier than the latest confirmed detector;
+                         * it is proof only after the complete tail and margin
+                         * are beyond the old exit.
+                         */
+                        int motion_clear =
+                                have_motion_lower_bound &&
+                                exit_distance_mm >= 0 &&
+                                runtime
+                                  ->conflict_zone_carry_scalar_proof_valid[
+                                          carry] &&
+                                progress_lower_um -
+                                                (int64_t)
+                                                TC2_TRAIN_HALF_LENGTH_MM *
+                                                        1000 >
+                                        ((int64_t)exit_distance_mm + 20) *
+                                                1000;
+                        int clear = scalar_clear || graph_clear ||
+                                motion_clear;
                         int carry_mode =
                                 runtime->conflict_zone_carry_mode[carry];
                         all_release_delay = all_release_delay &&
@@ -11060,12 +10749,13 @@ static int process_conflict_zone_carries(int slot, int now) {
 
                 /*
                  * UNKNOWN is intentionally fail-closed at replacement time:
-                 * no estimated position may release an old physical owner.
-                 * It must not, however, become an irrevocable deadlock.  A
-                 * later sensor-confirmed position farther than the complete
-                 * half-body plus the 20 mm margin from both old boundaries
-                 * proves the train is outside the zone.  At that point the
-                 * old traversal can be retired according to its real state.
+                 * neither a raw point estimate nor elapsed nominal travel
+                 * may release an old physical owner.  It must not, however,
+                 * become an irrevocable deadlock.  A later real detector or
+                 * the uncertainty-discounted motion lower bound farther than
+                 * the complete half-body plus the 20 mm margin proves the
+                 * train is outside the zone.  At that point the old traversal
+                 * can be retired according to its real state.
                  */
                 /*
                  * UNENTERED is already a physical proof recorded when the
@@ -11078,9 +10768,10 @@ static int process_conflict_zone_carries(int slot, int now) {
                  * owning the zone forever.
                  *
                  * UNKNOWN and OCCUPIED remain fail-closed and still require
-                 * the scalar/graph clearance proof below.  Releasing this
-                 * ticket does not release the canceled train's stationary
-                 * route reservation, so its physical body remains a block.
+                 * a confirmed scalar, exact graph, or conservative motion
+                 * lower-bound clearance proof.  Releasing this ticket does
+                 * not release a canceled train's stationary reservation, so
+                 * its physical body remains a block.
                  */
                 if (live_members == 0) {
                         remove_conflict_zone_carry_cohort(
@@ -11111,6 +10802,226 @@ static int process_conflict_zone_carries(int slot, int now) {
                         continue;
                 }
                 ++index;
+        }
+        return 0;
+}
+
+/*
+ * A hard next and a soft next-next are deliberately separate route stages,
+ * but they must not be allowed to form a hold-and-wait cycle before either
+ * train has entered its hard stage.  The common case is:
+ *
+ *     A owns next X and waits for next-next Y
+ *     B owns next Y and waits for next-next X
+ *
+ * If B has never received a positive-speed command, its complete hard cohort
+ * is still physically unentered.  Yield that cohort atomically, discard B's
+ * old future queue tickets, and let it requeue behind A after the normal
+ * resource-owned two-second handoff delay.  Route, localization, body
+ * reservation, and held/occupied resources are untouched.
+ *
+ * This is intentionally not a general deadlock breaker: once a train has
+ * launched, or any member is OCCUPIED/RELEASE_DELAY, physical evidence wins
+ * and the owner remains fail-closed.
+ */
+static int conflict_zone_stages_share_resource(
+        const tc2_conflict_zone_route_plan *left_plan, int left_step,
+        const tc2_conflict_zone_route_plan *right_plan, int right_step) {
+        if (!left_plan || !right_plan) return 0;
+        const tc2_conflict_zone_route_stage *left =
+                conflict_zone_stage_for_step(left_plan, left_step);
+        const tc2_conflict_zone_route_stage *right =
+                conflict_zone_stage_for_step(right_plan, right_step);
+        if (!left || !right || left->member_step[0] != left_step ||
+            right->member_step[0] != right_step) {
+                return 0;
+        }
+        for (int l = 0; l < left->member_count; ++l) {
+                int left_raw = left->member_step[l];
+                int left_zone = left_plan->steps[left_raw].zone;
+                for (int r = 0; r < right->member_count; ++r) {
+                        int right_raw = right->member_step[r];
+                        if (left_zone == right_plan->steps[right_raw].zone) {
+                                return 1;
+                        }
+                }
+        }
+        return 0;
+}
+
+static int conflict_zone_stage_owned_by_slot(
+        int slot, int step, int require_yieldable) {
+        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS) return 0;
+        const tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
+        const tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
+        if (!runtime->conflict_zone_plan_valid ||
+            step < 0 || step >= runtime->conflict_zone_plan.step_count ||
+            runtime->conflict_zone_hard_step != step ||
+            runtime->conflict_zone_hard_ticket == 0) {
+                return 0;
+        }
+        const tc2_conflict_zone_route_stage *stage =
+                conflict_zone_stage_for_step(
+                        &runtime->conflict_zone_plan, step);
+        if (!stage || stage->member_step[0] != step) return 0;
+        for (int member = 0; member < stage->member_count; ++member) {
+                int raw_step = stage->member_step[member];
+                tc2_conflict_zone_grant grant;
+                if (Tc2ConflictZoneQueryGrant(
+                            &dispatch_conflict_zones,
+                            runtime->conflict_zone_plan.steps[raw_step].zone,
+                            &grant) <= 0 ||
+                    grant.owner_train != job->train ||
+                    grant.owner_ticket !=
+                            runtime->conflict_zone_hard_ticket ||
+                    grant.owner_route_generation !=
+                            runtime->conflict_zone_route_generation) {
+                        return 0;
+                }
+                if (require_yieldable &&
+                    grant.state != TC2_CONFLICT_ZONE_GRANTED &&
+                    grant.state != TC2_CONFLICT_ZONE_SETTING &&
+                    grant.state != TC2_CONFLICT_ZONE_SETTLED) {
+                        return 0;
+                }
+        }
+        return 1;
+}
+
+static int yield_prelaunch_conflict_cycle_slot(int slot) {
+        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS) return -1;
+        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
+        tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
+        int hard_step = runtime->conflict_zone_hard_step;
+        const tc2_conflict_zone_route_stage *hard_stage =
+                conflict_zone_stage_for_step(
+                        &runtime->conflict_zone_plan, hard_step);
+        if (!hard_stage || hard_stage->member_step[0] != hard_step ||
+            !conflict_zone_stage_owned_by_slot(slot, hard_step, 1)) {
+                return -1;
+        }
+
+        if (runtime->conflict_zone_batch_token != 0) {
+                can_batch_status_t status;
+                unsigned int token = runtime->conflict_zone_batch_token;
+                if (CanGetBatchStatus(dispatch_can_tid, token, &status) < 0 ||
+                    status.token != token) {
+                        return -1;
+                }
+                if (status.state == CAN_BATCH_PENDING &&
+                    CanCancelBatch(dispatch_can_tid, token) < 0) {
+                        return -1;
+                }
+        }
+        if (cancel_soft_conflict_zone_prefetch(slot, 1) < 0) return -1;
+
+        int zones[TC2_CONFLICT_STAGE_MAX_MEMBERS];
+        for (int member = 0; member < hard_stage->member_count; ++member) {
+                int raw_step = hard_stage->member_step[member];
+                zones[member] =
+                        runtime->conflict_zone_plan.steps[raw_step].zone;
+        }
+        if (Tc2ConflictZoneYieldUnenteredStage(
+                    &dispatch_conflict_zones, zones,
+                    hard_stage->member_count, job->train,
+                    runtime->conflict_zone_route_generation,
+                    runtime->conflict_zone_hard_ticket) < 0 ||
+            Tc2ConflictZoneCancelHard(
+                    &dispatch_conflict_zones, job->train) < 0 ||
+            Tc2ConflictZoneCancelSoft(
+                    &dispatch_conflict_zones, job->train) < 0) {
+                return -1;
+        }
+
+        runtime->conflict_zone_hard_step = -1;
+        runtime->conflict_zone_hard_ticket = 0;
+        runtime->conflict_zone_soft_step = -1;
+        runtime->conflict_zone_soft_ticket = 0;
+        runtime->conflict_zone_batch_token = 0;
+        runtime->conflict_zone_queue_pending = 0;
+        runtime->conflict_zone_settle_at_tick = -1;
+        reset_conflict_zone_action_cursor(runtime);
+        reset_soft_conflict_zone_cursor(runtime, 1);
+        if (job->state == TC2_JOB_READY) {
+                job->state = TC2_JOB_PREPARING;
+        }
+        return 0;
+}
+
+static int conflict_zone_find_slot_by_train(int train) {
+        if (train <= 0) return -1;
+        for (int slot = 0; slot < TC2_DISPATCH_MAX_JOBS; ++slot) {
+                if (dispatch_jobs[slot].state != TC2_JOB_EMPTY &&
+                    dispatch_jobs[slot].train == train) {
+                        return slot;
+                }
+        }
+        return -1;
+}
+
+static int resolve_prelaunch_conflict_zone_cycle(void) {
+        /* Prefer yielding the larger train id, without depending on slot order. */
+        for (int loser_train = 255; loser_train > 0; --loser_train) {
+                int loser = conflict_zone_find_slot_by_train(loser_train);
+                if (loser < 0) continue;
+                tc2_dispatch_job_snapshot *loser_job =
+                        &dispatch_jobs[loser];
+                tc2_dispatch_runtime *loser_runtime =
+                        &dispatch_runtime[loser];
+                if ((loser_job->state != TC2_JOB_PREPARING &&
+                     loser_job->state != TC2_JOB_READY) ||
+                    loser_job->launch_tick >= 0 ||
+                    loser_job->command_speed != 0 ||
+                    loser_runtime->command_speed != 0 ||
+                    !loser_runtime->conflict_zone_plan_valid) {
+                        continue;
+                }
+                int loser_hard = loser_runtime->conflict_zone_hard_step;
+                int loser_soft = next_conflict_zone_preparation_step(
+                        loser, loser_runtime->conflict_zone_next_step);
+                if (loser_soft < 0 ||
+                    !conflict_zone_stage_owned_by_slot(
+                            loser, loser_hard, 1)) {
+                        continue;
+                }
+
+                for (int peer = 0; peer < TC2_DISPATCH_MAX_JOBS; ++peer) {
+                        if (peer == loser ||
+                            dispatch_jobs[peer].state == TC2_JOB_EMPTY ||
+                            !dispatch_runtime[peer]
+                                     .conflict_zone_plan_valid) {
+                                continue;
+                        }
+                        tc2_dispatch_runtime *peer_runtime =
+                                &dispatch_runtime[peer];
+                        int peer_hard =
+                                peer_runtime->conflict_zone_hard_step;
+                        int peer_soft = next_conflict_zone_preparation_step(
+                                peer,
+                                peer_runtime->conflict_zone_next_step);
+                        if (peer_soft < 0 ||
+                            !conflict_zone_stage_owned_by_slot(
+                                    peer, peer_hard, 0)) {
+                                continue;
+                        }
+                        int reciprocal =
+                                conflict_zone_stages_share_resource(
+                                        &loser_runtime
+                                                 ->conflict_zone_plan,
+                                        loser_hard,
+                                        &peer_runtime
+                                                 ->conflict_zone_plan,
+                                        peer_soft) &&
+                                conflict_zone_stages_share_resource(
+                                        &loser_runtime
+                                                 ->conflict_zone_plan,
+                                        loser_soft,
+                                        &peer_runtime
+                                                 ->conflict_zone_plan,
+                                        peer_hard);
+                        if (!reciprocal) continue;
+                        return yield_prelaunch_conflict_cycle_slot(loser);
+                }
         }
         return 0;
 }
@@ -11154,6 +11065,15 @@ static void process_conflict_zones(int now) {
                             slot, runtime->conflict_zone_next_step) < 0) {
                         fail_job(slot, TC2_FAILURE_RESERVATION);
                 }
+        }
+
+        /*
+         * All hard and soft intents are now visible.  Break only a proved
+         * reciprocal prelaunch hold-and-wait cycle; ordinary FIFO waits and
+         * every physically entered owner remain unchanged.
+         */
+        if (resolve_prelaunch_conflict_zone_cycle() < 0) {
+                dispatch_scheduler_healthy = 0;
         }
 
         /*
@@ -12022,32 +11942,6 @@ static int route_has_foreign_active_sensor(
         return -1;
 }
 
-static int prelaunch_sensor_changed(
-        const tc2_dispatch_runtime *runtime,
-        const train_sensor_snapshot_t *sensor) {
-        for (int offset = 0;
-             offset < runtime->safety_footprint.node_count; ++offset) {
-                int node = runtime->safety_footprint.nodes[offset];
-                int physical[2] = {node, physical_reverse_index(node)};
-                for (int side = 0; side < 2; ++side) {
-                        int candidate = physical[side];
-                        if (candidate < 0 ||
-                            candidate >= TRAIN_SENSOR_COUNT ||
-                            candidate == runtime->start_node ||
-                            candidate ==
-                                    physical_reverse_index(
-                                            runtime->start_node)) {
-                                continue;
-                        }
-                        if (!runtime->prepare_sensor_state[candidate] &&
-                            sensor->sensor_state[candidate]) {
-                                return candidate;
-                        }
-                }
-        }
-        return -1;
-}
-
 static int journal_is_clean_after(
         int train, unsigned int after) {
         for (int page = 0; page < 8; ++page) {
@@ -12065,14 +11959,6 @@ static int journal_is_clean_after(
                 after = batch.newest_sequence;
         }
         return 0;
-}
-
-static int prelaunch_journal_is_clean(
-        const tc2_dispatch_job_snapshot *job,
-        const tc2_dispatch_runtime *runtime) {
-        return journal_is_clean_after(
-                job->train,
-                runtime->prepare_attributed_sequence);
 }
 
 static int prepare_waiting_job(int slot, int now) {
@@ -12146,22 +12032,31 @@ static int prepare_waiting_job(int slot, int now) {
                 fail_job(slot, TC2_FAILURE_SENSOR_SERVICE);
                 return -1;
         }
-        if (runtime->stage_sensor_baseline_valid &&
-            !journal_is_clean_after(
-                    job->train,
-                    runtime->stage_attributed_sequence)) {
-                fail_job(slot, TC2_FAILURE_SENSOR_SEQUENCE);
-                return -1;
-        }
+        /*
+         * A staged train is still commanded to speed zero.  Its origin
+         * detector may settle or be reported again while route planning is
+         * in progress (and other managed trains may also change the global
+         * sensor journal).  Neither event can be evidence that this train
+         * moved out of sequence before launch.  The route is selected from
+         * the fresh snapshot above, and launch_ready_jobs() establishes the
+         * movement journal baseline atomically with the positive-speed CAN
+         * batch.  Sensor-sequence enforcement therefore starts at launch,
+         * not at staging.
+         */
         /*
          * CURRENT staging preserves the ARRIVED job's CAN baseline.  A
          * turnout change between staging and planning must not become the
          * new trusted baseline, especially when an identical prior setting
          * would otherwise be reused without retransmission.
          */
-        if (can_health_is_safe(slot, 0, now) < 0) {
+        int prepare_can_health =
+                can_health_is_safe(slot, 0, now);
+        if (prepare_can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                 fail_job(slot, TC2_FAILURE_CAN_HEALTH);
                 return -1;
+        }
+        if (prepare_can_health == TC2_CAN_HEALTH_RETRY) {
+                return 1;
         }
         if (choose_shortest_available_route(
                     slot, &reservation, &sensor, &route, &target,
@@ -12506,9 +12401,14 @@ static int prepare_waiting_job(int slot, int now) {
          * leaves the preceding hold and its generation byte-for-byte
          * unchanged.
          */
-        if (can_health_is_safe(slot, 0, now) < 0) {
+        prepare_can_health =
+                can_health_is_safe(slot, 0, now);
+        if (prepare_can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                 fail_job(slot, TC2_FAILURE_CAN_HEALTH);
                 return -1;
+        }
+        if (prepare_can_health == TC2_CAN_HEALTH_RETRY) {
+                return 1;
         }
 
         selected_side_definition =
@@ -12765,11 +12665,6 @@ static int prepare_waiting_job(int slot, int now) {
         runtime->route = route;
         runtime->safety_footprint = safety_footprint;
         runtime->route_valid = 1;
-        if (build_power_dead_zone_plan(
-                    runtime, destination_route_offset) < 0) {
-                fail_job(slot, TC2_FAILURE_ROUTE);
-                return -1;
-        }
         runtime->movement_plan_active = 1;
         runtime->lifecycle_stop_reason =
                 TC2_LIFECYCLE_STOP_NONE;
@@ -12904,7 +12799,9 @@ static int prepare_waiting_job(int slot, int now) {
                 fail_job(slot, TC2_FAILURE_SENSOR_SERVICE);
                 return -1;
         }
-        if (can_health_is_safe(slot, 0, now) < 0) {
+        prepare_can_health =
+                can_health_is_safe(slot, 0, now);
+        if (prepare_can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                 fail_job(slot, TC2_FAILURE_CAN_HEALTH);
                 return -1;
         }
@@ -13264,12 +13161,9 @@ static int traffic_effective_speed(int slot) {
  */
 static int traffic_safety_evaluation_speed(int slot) {
         int speed = traffic_effective_speed(slot);
-        if (speed < 0 || slot < 0 ||
+        if (speed != 0 || slot < 0 ||
             slot >= TC2_DISPATCH_MAX_JOBS) {
                 return speed;
-        }
-        if (speed > 0) {
-                return power_dead_zone_effective_speed(slot, speed);
         }
         int state = dispatch_jobs[slot].state;
         if (state != TC2_JOB_PREPARING &&
@@ -13278,17 +13172,12 @@ static int traffic_safety_evaluation_speed(int slot) {
                 return 0;
         }
         int planned = dispatch_runtime[slot].planned_launch_speed;
-        return planned >= 1 && planned <= 120 ?
-                power_dead_zone_effective_speed(slot, planned) : 0;
+        return planned >= 1 && planned <= 120 ? planned : 0;
 }
 
 static int traffic_braking_envelope_mm(int slot) {
         int speed = traffic_effective_speed(slot);
         if (speed < 0) return -1;
-        if (speed > 0) {
-                speed = power_dead_zone_effective_speed(slot, speed);
-                if (speed < 0) return -1;
-        }
         return speed == 0 ?
                 0 : Tc2MotionBrakingDistanceMm(speed);
 }
@@ -13301,10 +13190,6 @@ static int traffic_braking_envelope_mm(int slot) {
 static int traffic_collision_stop_distance_mm(int slot) {
         int speed = traffic_effective_speed(slot);
         if (speed < 0) return -1;
-        if (speed > 0) {
-                speed = power_dead_zone_effective_speed(slot, speed);
-                if (speed < 0) return -1;
-        }
         return speed == 0 ?
                 0 : Tc2MotionStopDistanceMm(speed);
 }
@@ -13607,9 +13492,6 @@ static int resume_traffic_hold(
             runtime->traffic_hold_distance_um < 0) {
                 return -1;
         }
-        int resume_speed = power_dead_zone_adjusted_speed(
-                slot, runtime->traffic_resume_speed);
-        if (resume_speed < 1) return -1;
         track_reservation_snapshot reservation;
         if (TrackReservationServerSnapshot(
                     dispatch_reservation_tid,
@@ -13627,23 +13509,27 @@ static int resume_traffic_hold(
                     slot, &reservation) ||
             !traffic_resume_fits_current_authority(
                     slot,
-                    resume_speed)) {
+                    runtime->traffic_resume_speed)) {
                 /* Normal rolling-authority/turnout wait; retry next tick. */
                 return 1;
         }
-        if (can_health_is_safe(slot, 0, now) < 0) {
+        int can_health = can_health_is_safe(slot, 0, now);
+        if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                 return -1;
         }
+        if (can_health == TC2_CAN_HEALTH_RETRY) return 1;
         int resume_command =
                 command_train_positive_speed_with_retry(
-                        slot, resume_speed);
+                        slot, runtime->traffic_resume_speed);
         if (resume_command < 0) return -1;
         if (resume_command > 0) return 1;
         int confirmed = Time();
         if (confirmed < 0) return -1;
 
-        runtime->command_speed = resume_speed;
-        runtime->motion_speed_ceiling = resume_speed;
+        runtime->command_speed =
+                runtime->traffic_resume_speed;
+        runtime->motion_speed_ceiling =
+                runtime->traffic_resume_speed;
         runtime->motion_anchor_distance_um =
                 runtime->preorigin_sensor_pending &&
                         runtime->preorigin_traffic_hold_valid ?
@@ -13724,10 +13610,12 @@ static int defer_traffic_resume_for_conflict_zone(int slot, int now) {
                     job->plan_generation ||
             reservation.destination_by_train[job->train] !=
                     job->target_node ||
-            sensor_health_is_safe(slot, &sensors, 0, now) < 0 ||
-            can_health_is_safe(slot, 0, now) < 0) {
+            sensor_health_is_safe(slot, &sensors, 0, now) < 0) {
                 return -1;
         }
+        int can_health = can_health_is_safe(slot, 0, now);
+        if (can_health == TC2_CAN_HEALTH_HARD_FAIL) return -1;
+        if (can_health == TC2_CAN_HEALTH_RETRY) return 1;
 
         if (!traffic_has_movement_authority(slot, &reservation) ||
             !traffic_resume_fits_current_authority(
@@ -14161,15 +14049,9 @@ static int begin_bounded_destination_correction(int slot, int now) {
         }
 
         /* Positive correction now runs to d; sensors only re-anchor it. */
-        int correction_speed = power_dead_zone_adjusted_speed(
-                slot, TC2_DESTINATION_CORRECTION_SPEED);
-        if (correction_speed < 1) return -1;
-        travel_ticks = Tc2MotionProvisionalSlowTravelTicks(
-                correction_speed, command_travel_mm);
-        if (travel_ticks < 1) return 0;
         int correction_command =
                 command_train_positive_speed_with_retry(
-                        slot, correction_speed);
+                        slot, TC2_DESTINATION_CORRECTION_SPEED);
         if (correction_command < 0) return -1;
         if (correction_command > 0) {
                 return 0;
@@ -14197,13 +14079,14 @@ static int begin_bounded_destination_correction(int slot, int now) {
         runtime->authority_resume_pending = 0;
         runtime->prelaunch_traffic_blocked = 0;
         runtime->authority_previous_end_offset = -1;
-        runtime->command_speed = correction_speed;
-        runtime->motion_speed_ceiling = correction_speed;
+        runtime->command_speed = TC2_DESTINATION_CORRECTION_SPEED;
+        runtime->motion_speed_ceiling =
+                TC2_DESTINATION_CORRECTION_SPEED;
         runtime->motion_anchor_distance_um =
                 correction_start_um;
         runtime->motion_anchor_tick = now;
         runtime->motion_anchor_from_traffic = 0;
-        job->command_speed = correction_speed;
+        job->command_speed = TC2_DESTINATION_CORRECTION_SPEED;
         /*
          * This positive command starts a new, real-sensor-anchored motion
          * interval.  Do not let the optimistic estimate which caused the
@@ -14215,7 +14098,7 @@ static int begin_bounded_destination_correction(int slot, int now) {
                 runtime->destination_correction_deadline_tick;
         job->prediction_velocity_um_per_tick =
                 Tc2MotionProvisionalVelocityUmPerTick(
-                        correction_speed);
+                        TC2_DESTINATION_CORRECTION_SPEED);
         job->prediction_anchor_tick = now;
         job->prediction_anchor_distance_mm =
                 (int)((correction_start_um + 999) / 1000);
@@ -14406,15 +14289,9 @@ static int begin_bounded_virtual_endpoint_approach(int slot, int now) {
                 if (pending_resume) return 0;
                 return stage_bounded_destination_correction(slot, -1);
         }
-        int correction_speed = power_dead_zone_adjusted_speed(
-                slot, TC2_DESTINATION_CORRECTION_SPEED);
-        if (correction_speed < 1) return -1;
-        travel_ticks = Tc2MotionProvisionalFastTravelTicks(
-                correction_speed, command_travel_mm);
-        if (travel_ticks < 1) return 0;
         int endpoint_command =
                 command_train_positive_speed_with_retry(
-                        slot, correction_speed);
+                        slot, TC2_DESTINATION_CORRECTION_SPEED);
         if (endpoint_command < 0) return -1;
         if (endpoint_command > 0) {
                 return pending_resume ? 0 :
@@ -14440,18 +14317,19 @@ static int begin_bounded_virtual_endpoint_approach(int slot, int now) {
         runtime->authority_resume_pending = 0;
         runtime->prelaunch_traffic_blocked = 0;
         runtime->authority_previous_end_offset = -1;
-        runtime->command_speed = correction_speed;
-        runtime->motion_speed_ceiling = correction_speed;
+        runtime->command_speed = TC2_DESTINATION_CORRECTION_SPEED;
+        runtime->motion_speed_ceiling =
+                TC2_DESTINATION_CORRECTION_SPEED;
         runtime->motion_anchor_distance_um =
                 correction_start_um;
         runtime->motion_anchor_tick = now;
         runtime->motion_anchor_from_traffic = 0;
-        job->command_speed = correction_speed;
+        job->command_speed = TC2_DESTINATION_CORRECTION_SPEED;
         job->braking_at_tick =
                 runtime->destination_correction_deadline_tick;
         job->prediction_velocity_um_per_tick =
                 Tc2MotionProvisionalVelocityUmPerTick(
-                        correction_speed);
+                        TC2_DESTINATION_CORRECTION_SPEED);
         job->prediction_anchor_tick = now;
         job->prediction_anchor_distance_mm =
                 (int)((correction_start_um + 999) / 1000);
@@ -15455,7 +15333,6 @@ static int can_train_move_with_reservation(
             unknown_static_block_exists_except(slot) ||
             !regular_movement_gates_ready(slot) ||
             !traffic_has_movement_authority(slot, reservation) ||
-            !power_dead_zone_authority_ready(slot, reservation) ||
             !destination_area_safe(slot, reservation)) {
                 return 0;
         }
@@ -15490,8 +15367,11 @@ static int can_train_move(int slot) {
                     dispatch_reservation_tid, &reservation) < 0 ||
             TrainSensorGetLatest(
                     dispatch_sensor_tid, &sensors) < 0 ||
-            sensor_health_is_safe(slot, &sensors, 0, now) < 0 ||
-            can_health_is_safe(slot, 0, now) < 0) {
+            sensor_health_is_safe(slot, &sensors, 0, now) < 0) {
+                return 0;
+        }
+        if (can_health_is_safe(slot, 0, now) !=
+                    TC2_CAN_HEALTH_OK) {
                 return 0;
         }
         return can_train_move_with_reservation(slot, &reservation);
@@ -15775,19 +15655,11 @@ static void process_traffic_safety(int now) {
                                           TC2_JOB_READY ||
                                   dispatch_jobs[rear].state ==
                                           TC2_JOB_LAUNCHING));
-                        int rear_resume_speed =
-                                dispatch_runtime[rear]
-                                        .traffic_resume_speed;
-                        if (rear_resume_speed > 0) {
-                                rear_resume_speed =
-                                        power_dead_zone_effective_speed(
-                                                rear,
-                                                rear_resume_speed);
-                        }
                         int rear_envelope =
                                 rear_latched ?
                                 Tc2MotionStopDistanceMm(
-                                        rear_resume_speed) :
+                                        dispatch_runtime[rear]
+                                                .traffic_resume_speed) :
                                 rear_speed > 0 ?
                                 Tc2MotionStopDistanceMm(rear_speed) : 0;
                         int rear_stop_threshold =
@@ -17138,12 +17010,9 @@ static int authority_restore_requested_speed(
                 return 0;
         }
         int64_t progress_um;
-        int restored_speed = power_dead_zone_adjusted_speed(
-                slot, job->speed);
-        if (restored_speed < 1) return -1;
         int restore_command =
                 command_train_positive_speed_with_retry(
-                        slot, restored_speed);
+                        slot, job->speed);
         if (restore_command < 0) return -1;
         if (restore_command > 0) return 0;
         int confirmed = Time();
@@ -17163,13 +17032,13 @@ static int authority_restore_requested_speed(
                 progress_um;
         runtime->motion_anchor_tick = confirmed;
         runtime->motion_anchor_from_traffic = 0;
-        runtime->command_speed = restored_speed;
-        runtime->motion_speed_ceiling = restored_speed;
+        runtime->command_speed = job->speed;
+        runtime->motion_speed_ceiling = job->speed;
         runtime->speed_reduction_pending = 0;
         runtime->precision_approach_active = 0;
         runtime->authority_previous_end_offset = -1;
         runtime->observed_velocity_um_per_tick = -1;
-        job->command_speed = restored_speed;
+        job->command_speed = job->speed;
         return schedule_motion_deadlines(
                 slot, confirmed) < 0 ? -1 : 1;
 }
@@ -17229,10 +17098,12 @@ static int acquire_reversal_authority(
                             .destination_by_train[job->train] !=
                     job->target_node ||
             sensor_health_is_safe(
-                    slot, &sensors, 0, now) < 0 ||
-            can_health_is_safe(slot, 0, now) < 0) {
+                    slot, &sensors, 0, now) < 0) {
                 return -1;
         }
+        int can_health = can_health_is_safe(slot, 0, now);
+        if (can_health == TC2_CAN_HEALTH_HARD_FAIL) return -1;
+        if (can_health == TC2_CAN_HEALTH_RETRY) return 1;
         int progress_mm;
         if (route_distance_to_offset(
                     &runtime->route, next_leg,
@@ -17551,13 +17422,15 @@ static void process_authority_holds(int now) {
                                 TC2_FAILURE_SENSOR_SERVICE);
                         continue;
                 }
-                if (can_health_is_safe(
-                            oldest, 0, now) < 0) {
+                int can_health = can_health_is_safe(
+                        oldest, 0, now);
+                if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                         fail_job(
                                 oldest,
                                 TC2_FAILURE_CAN_HEALTH);
                         continue;
                 }
+                if (can_health == TC2_CAN_HEALTH_RETRY) continue;
                 if (!authority_dynamic_resume_is_safe(
                             oldest, now,
                             &reservation)) {
@@ -17759,7 +17632,7 @@ static void process_authority_holds(int now) {
                                 job->destination_offset_mm,
                                 job->destination_distance_mm,
                                 authority_speed,
-                                0,
+                                correction_authority_end < 0,
                                 occupancy_upper_mm,
                                 job->train,
                                 &reservation, &sensors,
@@ -18640,17 +18513,16 @@ static int recover_forward_direct_sensor_observation(
 }
 
 /*
- * The two real detectors catalogued around a lowercase destination are both
- * terminal localization evidence.  During the explicit speed-40 correction,
- * the opposite-side detector can lie beyond the virtual destination and is
- * therefore outside the monitor's ordinary next/next-next sensor window.
- * Recover that report only when the exact directed route occurrence is still
- * inside both the monitor guard and the train's already-owned physical
- * footprint.  This changes no authority and releases no reservation tail.
+ * At a zero-offset endpoint, either directed half of the coincident physical
+ * detector is a valid completion report.  Its reverse-directed name can be
+ * outside the ordinary next/next-next monitor window, so recover the exact
+ * route occurrence only while it remains inside the train's already-owned
+ * authority and physical footprint.  This grants no new movement authority
+ * and releases no reservation tail.  Non-zero endpoint offsets never use
+ * this exception.
  *
- * Return 0 after recovery, 1 when this is not a destination boundary report,
- * 2 when it is a boundary report outside usable authority, and -1 on an
- * internal invariant failure.
+ * Return 0 after recovery, 1 when the report is not such a boundary, 2 when
+ * it is a boundary outside usable authority, and -1 on an invariant failure.
  */
 static int recover_destination_boundary_sensor_observation(
         int slot, int sensor_node,
@@ -18663,6 +18535,7 @@ static int recover_destination_boundary_sensor_observation(
         }
         tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
         if (!runtime->destination_correction_active ||
+            !destination_boundary_sensor_ends_trip(&dispatch_jobs[slot]) ||
             observation->classification !=
                     TC2_ROUTE_SENSOR_SPURIOUS ||
             destination_boundary_sensor_mask(slot, sensor_node) == 0) {
@@ -18690,7 +18563,6 @@ static int recover_destination_boundary_sensor_observation(
                 }
         }
         if (matched_offset < 0) {
-                /* A raw boundary pulse not on this directed route is unsafe. */
                 return 2;
         }
 
@@ -18718,15 +18590,6 @@ static int recover_destination_boundary_sensor_observation(
                 TC2_ROUTE_SENSOR_MISSING_ONE;
         observation->missing = observation->expected;
         observation->matched.route_offset = matched_offset;
-        /*
-         * Keep the committed node consistent with the directed route
-         * occurrence.  The raw feedback may name the reverse-directed half
-         * of the same physical detector; storing that raw node beside this
-         * route offset would make the next movement-gate check believe the
-         * train had left its route.  The boundary mask above still uses the
-         * raw report, so either physical destination-side detector remains
-         * valid evidence.
-         */
         observation->matched.node_index =
                 runtime->route.nodes[matched_offset];
         observation->matched.distance_mm = matched_distance;
@@ -18881,10 +18744,9 @@ static int process_sensor_observation(
                 if (recovered < 0) return -1;
                 if (recovered == 2) {
                         /*
-                         * The train reported a real destination boundary but
-                         * that detector was outside the already-owned guard.
-                         * Stop immediately; do not accept it as arrival and
-                         * do not restart correction from projected position.
+                         * A real destination boundary reported outside the
+                         * already-owned correction guard.  Stop immediately
+                         * but fail closed rather than extending authority.
                          */
                         runtime->monitor.last_sequence = event->sequence;
                         runtime->destination_correction_active = 0;
@@ -19052,6 +18914,21 @@ static int process_sensor_observation(
         job->current_route_offset =
                 observation.matched.route_offset;
         job->current_node = observation.matched.node_index;
+        /*
+         * This is the single localization commit point.  Duplicate,
+         * spurious, wrong-generation, and implausibly early journal records
+         * have all returned above, so only this pair may be used to rebuild a
+         * CURRENT route or prove the directed pose around a physical reverse.
+         */
+        if (observation.matched.node_index >= 0 &&
+            observation.matched.node_index < TRACK_MAX &&
+            dispatch_track[observation.matched.node_index].type ==
+                    NODE_SENSOR) {
+                runtime->last_accepted_sensor_node =
+                        observation.matched.node_index;
+                runtime->last_accepted_sensor_sequence =
+                        event->sequence;
+        }
         job->confirmed_distance_mm =
                 observation.matched.distance_mm;
         /*
@@ -19142,18 +19019,22 @@ static int process_sensor_observation(
         }
 
         /*
-         * During the explicit terminal speed-40 correction, real detectors
-         * are localization anchors rather than stop boundaries.  Rebase at
-         * every ordered observation and keep moving toward the scalar d
-         * coordinate.  A missing intermediate detector therefore cannot end
-         * the correction; the independently checked turnout/authority gates
-         * remain the only earlier movement boundaries.
+         * During the explicit terminal speed-40 correction, ordinary real
+         * detectors only re-anchor scalar progress.  The sole exception is a
+                 * terminal boundary endpoint: either directed report from its
+                 * physical detector ends correction.  This includes zero-offset
+                 * endpoints plus d3/d8. Other non-coincident destinations keep
+                 * their original remaining-distance behavior. Turnout and authority
+                 * gates remain the only earlier movement boundaries.
          */
         if (runtime->destination_correction_active) {
                 int observed_distance_mm = -1;
                 unsigned int boundary_mask =
                         destination_boundary_sensor_mask(
                                 slot, event->sensor_index);
+                int exact_boundary_seen =
+                        destination_boundary_sensor_ends_trip(job) &&
+                        boundary_mask != 0;
                 if (Tc2RouteDistanceAtOffset(
                             dispatch_track, &runtime->route,
                             observation.matched.route_offset,
@@ -19162,18 +19043,18 @@ static int process_sensor_observation(
                         return -1;
                 }
                 /*
-                 * A non-boundary detector beyond d remains an invalid route
-                 * advance.  Either catalogued boundary is different: the
-                 * selected approach-side detector is a correction anchor,
-                 * while the opposite-side detector proves that d has already
-                 * been reached or passed and must stop the train immediately.
+                 * An observation past d remains invalid except for either
+                 * directed report from the physical detector that coincides
+                 * with a zero-offset destination.  A non-coincident endpoint
+                 * still uses its real sensor only as the correction anchor
+                 * and must cover the remaining distance to d.
                  */
                 if (observed_distance_mm >
                             job->destination_distance_mm &&
-                    boundary_mask == 0) {
+                    !exact_boundary_seen) {
                         return -1;
                 }
-                if (boundary_mask != 0 ||
+                if (exact_boundary_seen ||
                     observation.matched.route_offset ==
                             job->target_route_offset) {
                         runtime->target_seen = 1;
@@ -19206,23 +19087,14 @@ static int process_sensor_observation(
                                 slot, observed_distance_um);
                 update_next_sensor(slot);
 
-                unsigned int selected_side_bit =
-                        job->selected_destination_side >= 0 &&
-                        job->selected_destination_side <
-                                TC2_TRACK_DESTINATION_SIDE_COUNT ?
-                        1u << job->selected_destination_side : 0;
-                int opposite_boundary_seen =
-                        boundary_mask != 0 &&
-                        (selected_side_bit == 0 ||
-                         (boundary_mask & selected_side_bit) == 0);
-                if (remaining_um <= 0 || opposite_boundary_seen) {
+                if (remaining_um <= 0 || exact_boundary_seen) {
                         int endpoint_estimated =
                                 observed_distance_um != destination_um;
                         /*
-                         * Keep current_node/current_route_offset at the real
-                         * detector committed above so the terminal static
-                         * body is protected on the correct physical branch.
-                         * Only the public scalar is clamped to d.
+                         * Preserve the real detector node committed above
+                         * for terminal body occupancy.  Clamp only the public
+                         * scalar to d so the ordinary stop-settle path enters
+                         * the same ARRIVED state as every normal destination.
                          */
                         runtime->destination_correction_reached_endpoint = 1;
                         runtime->destination_correction_active = 0;
@@ -19257,6 +19129,92 @@ static int process_sensor_observation(
                 job->prediction_command_at_tick =
                         job->braking_at_tick;
                 return 0;
+        }
+
+        /*
+         * A d3/d8 boundary pulse proves that the train has reached the requested
+         * stopping boundary.  End the trip at that real observation and retire
+         * every correction flag before beginning the zero-speed settle.  In
+         * particular, the BRAKING settle path must not re-enter the virtual
+         * endpoint speed-40 approach after this stop.
+         */
+        if (!runtime->localization_only &&
+            (job->destination_index == 2 ||
+             job->destination_index == 7) &&
+            destination_boundary_sensor_mask(
+                    slot, event->sensor_index) != 0) {
+                int64_t destination_um =
+                        (int64_t)job->destination_distance_mm * 1000;
+                runtime->target_seen = 1;
+                runtime->target_corroborated = 1;
+                runtime->destination_correction_active = 0;
+                runtime->destination_correction_pending = 0;
+                runtime->destination_correction_attempted = 1;
+                runtime->destination_correction_reached_endpoint = 1;
+                runtime->destination_correction_deadline_tick = -1;
+                runtime->destination_correction_sensor_offset = -1;
+                job->estimated_distance_um = destination_um;
+                job->remaining_distance_mm = 0;
+                job->position_estimated = 0;
+                job->braking_at_tick = -1;
+                job->prediction_command_at_tick = -1;
+                job->next_sensor_node = -1;
+                begin_stop(
+                        slot, action_tick,
+                        TC2_STOP_DESTINATION, 0,
+                        TC2_STOP_TRIGGER_SENSOR);
+                return job->state == TC2_JOB_FAILED ? -1 : 0;
+        }
+
+        if (!runtime->localization_only &&
+            job->destination_offset_mm > 0) {
+                int observed_destination_side =
+                        destination_boundary_side_for_sensor(
+                                slot, event->sensor_index);
+                if (observed_destination_side >= 0 &&
+                    observation.matched.route_offset <=
+                            job->destination_route_offset &&
+                    observation.matched.route_offset !=
+                            job->target_route_offset) {
+                        const tc2_track_destination_side *definition =
+                                Tc2TrackDestinationSide(
+                                        job->destination_index,
+                                        observed_destination_side);
+                        int observed_distance_mm = -1;
+                        if (!definition ||
+                            Tc2RouteDistanceAtOffset(
+                                    dispatch_track, &runtime->route,
+                                    observation.matched.route_offset,
+                                    &observed_distance_mm) < 0 ||
+                            observed_distance_mm < 0) {
+                                return -1;
+                        }
+
+                        int corrected_offset_mm =
+                                definition->base_offset_mm +
+                                job->destination_speed_correction_mm;
+                        if (corrected_offset_mm < 0 ||
+                            observed_distance_mm >
+                                    0x7fffffff - corrected_offset_mm) {
+                                return -1;
+                        }
+                        job->selected_destination_side =
+                                observed_destination_side;
+                        job->target_node =
+                                runtime->route.nodes[
+                                        observation.matched.route_offset];
+                        job->target_route_offset =
+                                observation.matched.route_offset;
+                        job->destination_base_offset_mm =
+                                definition->base_offset_mm;
+                        job->destination_offset_mm =
+                                corrected_offset_mm;
+                        job->destination_distance_mm =
+                                observed_distance_mm +
+                                corrected_offset_mm;
+                        job->route_distance_mm =
+                                job->destination_distance_mm;
+                }
         }
 
         if (!runtime->localization_only &&
@@ -19471,18 +19429,14 @@ static int process_sensor_observation(
                         if (!regular_movement_gates_ready(slot)) {
                                 return 0;
                         }
-                        int restored_speed =
-                                power_dead_zone_adjusted_speed(
-                                        slot, job->speed);
-                        if (restored_speed < 1) return -1;
                         int restore_command =
                                 command_train_positive_speed_with_retry(
-                                        slot, restored_speed);
+                                        slot, job->speed);
                         if (restore_command < 0) return -1;
                         if (restore_command > 0) return 0;
-                        runtime->command_speed = restored_speed;
-                        job->command_speed = restored_speed;
-                        runtime->motion_speed_ceiling = restored_speed;
+                        runtime->command_speed = job->speed;
+                        job->command_speed = job->speed;
+                        runtime->motion_speed_ceiling = job->speed;
                         runtime->speed_reduction_pending = 0;
                         runtime->precision_approach_active = 0;
                 }
@@ -19561,14 +19515,15 @@ static int prelaunch_failure_reason(
                     slot, sensors, 0, now) < 0) {
                 return TC2_FAILURE_SENSOR_SERVICE;
         }
-        if (sensors->attribution_unavailable_count !=
-                    runtime->prepare_attribution_unavailable_count ||
-            sensors->unattributed_count !=
-                    runtime->prepare_unattributed_count ||
-            !prelaunch_journal_is_clean(job, runtime) ||
-            prelaunch_sensor_changed(runtime, sensors) >= 0) {
-                return TC2_FAILURE_SENSOR_SEQUENCE;
-        }
+        /*
+         * This train is still at speed zero.  Do not compare the fresh
+         * system-wide sensor counters with a staging-time snapshot here:
+         * those counters legitimately change when an origin contact settles
+         * or another train moves.  Reservation, localization, turnout and
+         * traffic gates above remain fail-closed.  Once the positive-speed
+         * batch is accepted, launch_ready_jobs() records the fresh per-train
+         * sequence/counter baseline used by the normal running checks.
+         */
         return TC2_FAILURE_NONE;
 }
 
@@ -19649,24 +19604,19 @@ static void launch_ready_jobs(int now) {
                         fail_job(slot, failure_reason);
                         continue;
                 }
-                if (can_health_is_safe(
-                            slot, 0, now) < 0) {
+                int can_health = can_health_is_safe(
+                        slot, 0, now);
+                if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                         fail_job(slot, TC2_FAILURE_CAN_HEALTH);
                         continue;
                 }
+                if (can_health == TC2_CAN_HEALTH_RETRY) continue;
                 slots[count] = slot;
                 trains[count] = job->train;
-                int launch_speed =
+                speeds[count] =
                         runtime->planned_launch_speed > 0 ?
                         runtime->planned_launch_speed :
                         job->speed;
-                launch_speed = power_dead_zone_adjusted_speed(
-                        slot, launch_speed);
-                if (launch_speed < 1) {
-                        fail_job(slot, TC2_FAILURE_INTERNAL);
-                        continue;
-                }
-                speeds[count] = launch_speed;
                 ++count;
         }
         if (count == 0) return;
@@ -19735,7 +19685,10 @@ static void launch_ready_jobs(int now) {
                         &dispatch_jobs[slot];
                 tc2_dispatch_runtime *runtime =
                         &dispatch_runtime[slot];
-                runtime->command_speed = speeds[index];
+                runtime->command_speed =
+                        runtime->planned_launch_speed > 0 ?
+                        runtime->planned_launch_speed :
+                        job->speed;
                 job->command_speed = runtime->command_speed;
                 runtime->motion_speed_ceiling =
                         runtime->command_speed;
@@ -19849,7 +19802,8 @@ static void process_launching_jobs(int now) {
                                 token, TC2_FAILURE_SENSOR_SERVICE);
                         continue;
                 }
-                if (can_health_is_safe(slot, 0, now) < 0) {
+                int can_health = can_health_is_safe(slot, 0, now);
+                if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                         fail_launch_wave(
                                 token, TC2_FAILURE_CAN_HEALTH);
                         continue;
@@ -19861,8 +19815,16 @@ static void process_launching_jobs(int now) {
                 }
                 if (status.confirmed <=
                     runtime->launch_batch_index) {
+                        /* A stale heartbeat is retryable while unconfirmed. */
                         continue;
                 }
+                /*
+                 * A successful exact batch-status query confirming this
+                 * train is stronger evidence than a delayed notifier
+                 * heartbeat.  The positive command may already be physical,
+                 * so enter RUNNING and let its recoverable health gate stop
+                 * it if the notifier remains stale.
+                 */
 
                 job->state = TC2_JOB_RUNNING;
                 runtime->lifecycle_stop_reason =
@@ -20061,20 +20023,19 @@ static void process_preparing_jobs(int now) {
                         fail_job(slot, TC2_FAILURE_SENSOR_SERVICE);
                         continue;
                 }
-                if (sensors.attribution_unavailable_count !=
-                            runtime
-                                    ->prepare_attribution_unavailable_count ||
-                    sensors.unattributed_count !=
-                            runtime->prepare_unattributed_count ||
-                    !prelaunch_journal_is_clean(job, runtime) ||
-                    prelaunch_sensor_changed(runtime, &sensors) >= 0) {
-                        fail_job(slot, TC2_FAILURE_SENSOR_SEQUENCE);
-                        continue;
-                }
-                if (can_health_is_safe(slot, 0, now) < 0) {
+                /*
+                 * PREPARING is a zero-speed state.  Origin-contact settling
+                 * and sensor events produced by other managed trains must
+                 * not turn this stopped train into a sensor-sequence
+                 * failure.  The accepted launch batch rebases all movement
+                 * sensor counters immediately before RUNNING.
+                 */
+                int can_health = can_health_is_safe(slot, 0, now);
+                if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                         fail_job(slot, TC2_FAILURE_CAN_HEALTH);
                         continue;
                 }
+                if (can_health == TC2_CAN_HEALTH_RETRY) continue;
 
                 if (runtime->reroute_reverse_before_resources) {
                         if (runtime->prelaunch_reverse_pending) {
@@ -20528,9 +20489,26 @@ static void process_running_jobs(int now) {
                         fail_job(slot, TC2_FAILURE_SENSOR_SEQUENCE);
                         continue;
                 }
-                if (can_health_is_safe(
-                            slot, 0, now) < 0) {
+                int can_health = can_health_is_safe(
+                        slot, 0, now);
+                if (can_health == TC2_CAN_HEALTH_HARD_FAIL) {
                         fail_job(slot, TC2_FAILURE_CAN_HEALTH);
+                        continue;
+                }
+                if (can_health == TC2_CAN_HEALTH_RETRY) {
+                        /*
+                         * A delayed controller-wide notifier heartbeat is a
+                         * recoverable loss of movement permission.  Stop a
+                         * moving train through the ordinary authority-hold
+                         * FSM; a train already braking has a zero command in
+                         * flight and only needs to wait for fresh evidence.
+                         */
+                        if (job->state == TC2_JOB_RUNNING) {
+                                (void)begin_local_authority_stop(
+                                        slot, now,
+                                        job->conflict_train,
+                                        -1, -1);
+                        }
                         continue;
                 }
                 int journal = drain_sensor_journal(slot, now);
@@ -20608,15 +20586,6 @@ static void process_running_jobs(int now) {
                                  */
                                 continue;
                         }
-                        int dead_zone_speed =
-                                maintain_power_dead_zone_speed(slot);
-                        if (dead_zone_speed < 0) {
-                                fail_job(
-                                        slot,
-                                        TC2_FAILURE_CAN_SERVICE);
-                                continue;
-                        }
-                        if (dead_zone_speed > 0) continue;
                         int64_t correction_progress_um;
                         if (job->destination_distance_mm < 0 ||
                             runtime_motion_progress_um(
@@ -20699,13 +20668,6 @@ static void process_running_jobs(int now) {
                         fail_job(slot, TC2_FAILURE_CAN_SERVICE);
                         continue;
                 }
-                int dead_zone_speed =
-                        maintain_power_dead_zone_speed(slot);
-                if (dead_zone_speed < 0) {
-                        fail_job(slot, TC2_FAILURE_CAN_SERVICE);
-                        continue;
-                }
-                if (dead_zone_speed > 0) continue;
 
                 /*
                  * A partial rolling authority is a hard movement limit, not
@@ -20720,7 +20682,6 @@ static void process_running_jobs(int now) {
                     runtime->authority_end_offset >= 0 &&
                     runtime->authority_end_offset <
                             job->destination_route_offset &&
-                    !power_dead_zone_crossing_active(slot) &&
                     !current_next_zone_covers_authority_end(slot) &&
                     !(runtime->leg_end_offset <
                                       job
@@ -20873,8 +20834,7 @@ static void process_running_jobs(int now) {
                         } else {
                                 clear_destination_anchor_seek(runtime);
                         }
-                        if (anchor_seek_expired &&
-                            !power_dead_zone_crossing_active(slot)) {
+                        if (anchor_seek_expired) {
                                 runtime->approach_sent = 1;
                                 begin_stop(
                                         slot, now,
@@ -20883,8 +20843,7 @@ static void process_running_jobs(int now) {
                                 continue;
                         }
                         if (progress_um >= command_um &&
-                            !wait_for_real_anchor &&
-                            !power_dead_zone_crossing_active(slot)) {
+                            !wait_for_real_anchor) {
                                 /*
                                  * This is the ordinary requested-speed stop.
                                  * Speed 40 is not a universal approach stage:
@@ -20977,7 +20936,6 @@ static void process_running_jobs(int now) {
 
                 if (!direct_final_leg &&
                     !runtime->approach_sent &&
-                    !power_dead_zone_crossing_active(slot) &&
                     tick_reached(now, job->braking_at_tick)) {
                         int purpose =
                                 runtime->leg_end_offset <
@@ -21131,9 +21089,6 @@ static int reversing_preflight_failure(int slot, int now) {
                     job->train,
                     runtime->last_journal_sequence)) {
                 return TC2_FAILURE_SENSOR_SEQUENCE;
-        }
-        if (can_health_is_safe(slot, 0, now) < 0) {
-                return TC2_FAILURE_CAN_HEALTH;
         }
         return TC2_FAILURE_NONE;
 }
@@ -21639,6 +21594,19 @@ static void process_braking_and_reversing(int now) {
                                 fail_job(slot, TC2_FAILURE_INTERNAL);
                         }
                 } else if (job->state == TC2_JOB_REVERSING) {
+                        int can_health =
+                                can_health_is_safe(slot, 0, now);
+                        if (can_health ==
+                                    TC2_CAN_HEALTH_HARD_FAIL) {
+                                fail_job(
+                                        slot,
+                                        TC2_FAILURE_CAN_HEALTH);
+                                continue;
+                        }
+                        if (can_health == TC2_CAN_HEALTH_RETRY) {
+                                /* Remain at confirmed zero speed. */
+                                continue;
+                        }
                         int preflight_failure =
                                 reversing_preflight_failure(
                                         slot, now);
@@ -21752,6 +21720,29 @@ static void process_braking_and_reversing(int now) {
                                                 TC2_FAILURE_CAN_SERVICE);
                                         continue;
                                 }
+                                /*
+                                 * The same physical detector has two directed
+                                 * track nodes.  Reverse changes that directed
+                                 * localization exactly once; leaving the old
+                                 * half here makes a later CURRENT reroute
+                                 * reverse the anchor a second time.
+                                 */
+                                int accepted_sensor =
+                                        runtime->last_accepted_sensor_node;
+                                int reversed_sensor =
+                                        physical_reverse_index(
+                                                accepted_sensor);
+                                if (accepted_sensor >= 0 &&
+                                    accepted_sensor < TRACK_MAX &&
+                                    reversed_sensor >= 0 &&
+                                    reversed_sensor < TRACK_MAX &&
+                                    dispatch_track[accepted_sensor].type ==
+                                            NODE_SENSOR &&
+                                    dispatch_track[reversed_sensor].type ==
+                                            NODE_SENSOR) {
+                                        runtime->last_accepted_sensor_node =
+                                                reversed_sensor;
+                                }
                                 runtime->reversal_phase =
                                         TC2_REVERSAL_PHASE_SETTLE;
                                 runtime->reverse_ready_at_tick =
@@ -21788,14 +21779,6 @@ static void process_braking_and_reversing(int now) {
                                 runtime
                                         ->planned_launch_speed :
                                 job->speed;
-                        launch_speed = power_dead_zone_adjusted_speed(
-                                slot, launch_speed);
-                        if (launch_speed < 1) {
-                                fail_job(
-                                        slot,
-                                        TC2_FAILURE_INTERNAL);
-                                continue;
-                        }
                         int launch_command =
                                 command_train_positive_speed_with_retry(
                                         slot, launch_speed);
@@ -22112,6 +22095,23 @@ static int retarget_request_is_older(
 static void clear_pending_retarget(
         tc2_dispatch_runtime *runtime) {
         if (!runtime) return;
+        /*
+         * Clearing an intent cannot undo a reverse already acknowledged by
+         * the locomotive.  Keep that directed-pose phase until a replacement
+         * route successfully commits it (or the physical train is removed).
+         */
+        int physical_reverse_pending =
+                runtime->retarget_reverse_pending;
+        int physical_reverse_ready_at_tick =
+                runtime->retarget_reverse_ready_at_tick;
+        int physical_direction_locked =
+                runtime->retarget_direction_locked;
+        int physical_direction_anchor_node =
+                runtime->retarget_direction_anchor_node;
+        unsigned int physical_direction_anchor_sequence =
+                runtime->retarget_direction_anchor_sequence;
+        int preserve_physical_reverse =
+                physical_reverse_pending || physical_direction_locked;
         runtime->retarget_pending = 0;
         runtime->retarget_armed = 0;
         runtime->retarget_speed = 0;
@@ -22125,6 +22125,20 @@ static void clear_pending_retarget(
         runtime->retarget_reverse_pending = 0;
         runtime->retarget_reverse_ready_at_tick = -1;
         runtime->retarget_direction_locked = 0;
+        runtime->retarget_direction_anchor_node = -1;
+        runtime->retarget_direction_anchor_sequence = 0;
+        if (preserve_physical_reverse) {
+                runtime->retarget_reverse_pending =
+                        physical_reverse_pending;
+                runtime->retarget_reverse_ready_at_tick =
+                        physical_reverse_ready_at_tick;
+                runtime->retarget_direction_locked =
+                        physical_direction_locked;
+                runtime->retarget_direction_anchor_node =
+                        physical_direction_anchor_node;
+                runtime->retarget_direction_anchor_sequence =
+                        physical_direction_anchor_sequence;
+        }
 }
 
 static void restore_pending_retarget(
@@ -22138,7 +22152,9 @@ static void restore_pending_retarget(
         int operator_reroute,
         int reverse_pending,
         int reverse_ready_at_tick,
-        int direction_locked) {
+        int direction_locked,
+        int direction_anchor_node,
+        unsigned int direction_anchor_sequence) {
         if (!runtime) return;
         runtime->retarget_pending = 1;
         runtime->retarget_armed = 1;
@@ -22153,6 +22169,97 @@ static void restore_pending_retarget(
         runtime->retarget_reverse_pending = reverse_pending;
         runtime->retarget_reverse_ready_at_tick = reverse_ready_at_tick;
         runtime->retarget_direction_locked = direction_locked;
+        runtime->retarget_direction_anchor_node =
+                direction_anchor_node;
+        runtime->retarget_direction_anchor_sequence =
+                direction_anchor_sequence;
+}
+
+/*
+ * A replacement reservation can commit before projection/CAN preparation
+ * finishes.  At that point old route metadata must not be restored, but the
+ * physical train still needs the same bounded zero-speed body from which the
+ * operator requested the reroute.  Reinstall only that measured body under
+ * the generation which actually committed; all candidate future authority is
+ * discarded and the durable CURRENT request will be evaluated again.
+ */
+static int recover_post_cas_public_retarget_body(
+        int slot, unsigned int generation,
+        int destination, int now) {
+        if (slot < 0 || slot >= TC2_DISPATCH_MAX_JOBS ||
+            generation == 0 || destination < 0 ||
+            destination >= TRACK_MAX || now < 0) {
+                return -1;
+        }
+
+        int train = dispatch_jobs[slot].train;
+        const track_route *body =
+                &dispatch_retarget_runtime_backup.safety_footprint;
+        if (train <= 0 ||
+            dispatch_retarget_job_backup.train != train ||
+            body->node_count <= 0 ||
+            !dispatch_retarget_runtime_backup
+                     .static_center_bounds_valid ||
+            dispatch_retarget_runtime_backup
+                            .static_center_lower_um < 0 ||
+            dispatch_retarget_runtime_backup
+                            .static_center_upper_um <
+                    dispatch_retarget_runtime_backup
+                            .static_center_lower_um ||
+            dispatch_retarget_job_backup.current_node < 0 ||
+            dispatch_retarget_job_backup.current_node >= TRACK_MAX ||
+            !stationary_window_contains_physical_node(
+                    body,
+                    dispatch_retarget_job_backup.current_node)) {
+                return -1;
+        }
+
+        track_reservation_conflict conflict;
+        conflict.node_index = -1;
+        conflict.owner_train = 0;
+        unsigned int same_generation = 0;
+        int status = TrackReservationServerUpdateWindow(
+                dispatch_reservation_tid, body, train,
+                destination, generation, &conflict,
+                &same_generation);
+        if (status != 0 || same_generation != generation) {
+                dispatch_jobs[slot].conflict_train =
+                        conflict.owner_train;
+                dispatch_jobs[slot].conflict_node =
+                        conflict.node_index;
+                return -1;
+        }
+
+        dispatch_jobs[slot] = dispatch_retarget_job_backup;
+        dispatch_runtime[slot] = dispatch_retarget_runtime_backup;
+        tc2_dispatch_job_snapshot *job = &dispatch_jobs[slot];
+        tc2_dispatch_runtime *runtime = &dispatch_runtime[slot];
+        job->plan_generation = generation;
+        job->target_node = destination;
+        job->state = TC2_JOB_STOPPED;
+        job->command_speed = 0;
+        job->hold_active = 1;
+        job->ready_at_tick = -1;
+        job->braking_at_tick = -1;
+        job->failure_reason = TC2_FAILURE_NONE;
+        job->stop_trigger = TC2_STOP_TRIGGER_NONE;
+        job->needs_stop_retry = 0;
+        runtime->command_speed = 0;
+        runtime->motion_speed_ceiling = 0;
+        runtime->movement_plan_active = 0;
+        runtime->lifecycle_stop_reason =
+                TC2_LIFECYCLE_STOP_REROUTE;
+
+        /*
+         * The candidate's future zone work was retired by fail_job().  The
+         * restored body owns no old next/nextnext ticket; a cleanup failure
+         * keeps it stopped but must not destroy the operator's request.
+         */
+        if (retire_terminal_conflict_zone_memory(slot, now) < 0) {
+                dispatch_scheduler_healthy = 0;
+        }
+        invalidate_projection(slot);
+        return 0;
 }
 
 /*
@@ -22162,8 +22269,9 @@ static void restore_pending_retarget(
  * server, but the live hold, projection, and runtime are copied aside first.
  * Until ReplacePlanExpected succeeds the reservation table is unchanged; a
  * route conflict restores the old slot byte-for-byte.  Once the generation
- * advances, the new reservation and its fail-closed state are authoritative
- * and must never be rolled back to stale metadata.
+ * advances, stale route/control metadata is never restored.  A failed public
+ * reroute may only reinstall the saved bounded physical body, and only after
+ * a generation-checked reservation shrink under the new identity succeeds.
  */
 static void process_pending_retargets(int now) {
         unsigned char processed[TC2_DISPATCH_MAX_JOBS];
@@ -22212,6 +22320,10 @@ static void process_pending_retargets(int now) {
                         held_runtime->retarget_reverse_ready_at_tick;
                 int retarget_direction_locked =
                         held_runtime->retarget_direction_locked;
+                int retarget_direction_anchor_node =
+                        held_runtime->retarget_direction_anchor_node;
+                unsigned int retarget_direction_anchor_sequence =
+                        held_runtime->retarget_direction_anchor_sequence;
                 int retarget_confirmed_start_node = -1;
                 int retarget_reversed_start_node = -1;
                 unsigned int expected_generation =
@@ -22229,8 +22341,34 @@ static void process_pending_retargets(int now) {
                 if (held_job->plan_generation !=
                             expected_generation ||
                     held_job->target_node !=
-                            expected_destination ||
-                    retarget_speed < 1 ||
+                            expected_destination) {
+                        if (retarget_operator_reroute &&
+                            held_job->state != TC2_JOB_EMPTY &&
+                            held_runtime->lifecycle_stop_reason !=
+                                    TC2_LIFECYCLE_STOP_REMOVE_PENDING) {
+                                /*
+                                 * The physical train is the identity of a
+                                 * public reroute.  A newer sensor-derived
+                                 * static-body generation must not make the
+                                 * command disappear; rebind the CAS guard to
+                                 * the current fail-closed object and continue.
+                                 */
+                                expected_generation =
+                                        held_job->plan_generation;
+                                expected_destination =
+                                        held_job->target_node;
+                                held_runtime
+                                        ->retarget_expected_generation =
+                                        expected_generation;
+                                held_runtime
+                                        ->retarget_expected_destination =
+                                        expected_destination;
+                        } else {
+                                clear_pending_retarget(held_runtime);
+                                continue;
+                        }
+                }
+                if (retarget_speed < 1 ||
                     retarget_speed > 120 ||
                     retarget_destination < 0 ||
                     retarget_destination >=
@@ -22296,7 +22434,9 @@ static void process_pending_retargets(int now) {
                                         1,
                                         retarget_reverse_pending,
                                         retarget_reverse_ready_at_tick,
-                                        retarget_direction_locked);
+                                        retarget_direction_locked,
+                                        retarget_direction_anchor_node,
+                                        retarget_direction_anchor_sequence);
                                 held_runtime->lifecycle_stop_reason =
                                         TC2_LIFECYCLE_STOP_REROUTE;
                                 /*
@@ -22334,10 +22474,72 @@ static void process_pending_retargets(int now) {
                                 1,
                                 retarget_reverse_pending,
                                 retarget_reverse_ready_at_tick,
-                                retarget_direction_locked);
+                                retarget_direction_locked,
+                                retarget_direction_anchor_node,
+                                retarget_direction_anchor_sequence);
                         held_runtime->lifecycle_stop_reason =
                                 TC2_LIFECYCLE_STOP_REROUTE;
+                        /*
+                         * A reverse acknowledgement records the opposite
+                         * directed node of one accepted physical detector.
+                         * Raw journal traffic is irrelevant here: duplicates,
+                         * spurious reports, and another train's events may all
+                         * advance it.  Only a newer accepted localization for
+                         * this train can invalidate the saved reverse pose.
+                         */
+                        int accepted_sensor_node =
+                                held_runtime->last_accepted_sensor_node;
+                        int accepted_reverse_node =
+                                physical_reverse_index(
+                                        accepted_sensor_node);
+                        int accepted_direction_anchor =
+                                held_runtime->retarget_reverse_pending ?
+                                accepted_reverse_node :
+                                accepted_sensor_node;
+                        if ((held_runtime->retarget_reverse_pending ||
+                             held_runtime->retarget_direction_locked) &&
+                            (accepted_sensor_node < 0 ||
+                             accepted_sensor_node >= TRACK_MAX ||
+                             dispatch_track[accepted_sensor_node].type !=
+                                     NODE_SENSOR ||
+                             held_runtime->retarget_direction_anchor_node < 0 ||
+                             held_runtime->retarget_direction_anchor_node >=
+                                     TRACK_MAX ||
+                             dispatch_track[
+                                     held_runtime
+                                             ->retarget_direction_anchor_node]
+                                             .type != NODE_SENSOR ||
+                             accepted_direction_anchor !=
+                                     held_runtime
+                                             ->retarget_direction_anchor_node ||
+                             held_runtime->retarget_direction_anchor_sequence !=
+                                     held_runtime
+                                             ->last_accepted_sensor_sequence)) {
+                                held_runtime->lifecycle_stop_reason =
+                                        TC2_LIFECYCLE_STOP_UNCONFIRMED;
+                                continue;
+                        }
                         if (held_runtime->retarget_reverse_pending) {
+                                if (held_runtime
+                                                    ->retarget_reverse_ready_at_tick <
+                                            0) {
+                                        /*
+                                         * The reverse CAN acknowledgement is
+                                         * the physical fact.  If the immediate
+                                         * clock read failed, start a complete
+                                         * settle interval on this later valid
+                                         * scheduler tick instead of forgetting
+                                         * the reverse or waiting forever.
+                                         */
+                                        held_runtime
+                                                ->retarget_reverse_ready_at_tick =
+                                                tick_after(
+                                                        now,
+                                                        TC2_REVERSE_SETTLE_TICKS);
+                                        retarget_reverse_ready_at_tick =
+                                                held_runtime
+                                                        ->retarget_reverse_ready_at_tick;
+                                }
                                 if (held_runtime
                                                     ->retarget_reverse_ready_at_tick <
                                             0 ||
@@ -22347,19 +22549,10 @@ static void process_pending_retargets(int now) {
                                                     ->retarget_reverse_ready_at_tick)) {
                                         continue;
                                 }
-                                int confirmed_offset =
-                                        held_runtime->monitor.confirmed_offset;
-                                int confirmed_node =
-                                        confirmed_offset >= 0 &&
-                                        confirmed_offset <
-                                                held_runtime->route.node_count ?
-                                        held_runtime->route.nodes[
-                                                confirmed_offset] : -1;
-                                int reversed = physical_reverse_index(
-                                        confirmed_node);
-                                if (confirmed_node < 0 || reversed < 0 ||
-                                    dispatch_track[confirmed_node].type !=
-                                            NODE_SENSOR ||
+                                int reversed = held_runtime
+                                        ->retarget_direction_anchor_node;
+                                if (reversed < 0 ||
+                                    reversed >= TRACK_MAX ||
                                     dispatch_track[reversed].type !=
                                             NODE_SENSOR) {
                                         held_runtime->lifecycle_stop_reason =
@@ -22370,46 +22563,64 @@ static void process_pending_retargets(int now) {
                                  * Reverse changes directed pose, never physical
                                  * occupancy.  Keep current_node and the bounded
                                  * body reservation untouched; the second-stage
-                                 * CURRENT candidate starts from the reverse of
-                                 * the latest confirmed real sensor and carries
-                                 * the stopped pre-origin distance separately.
+                         * CURRENT candidate starts from the directed real
+                         * sensor captured when reverse was acknowledged and
+                         * carries the stopped pre-origin distance separately.
                                  */
                                 held_runtime->retarget_reverse_pending = 0;
                                 held_runtime->retarget_reverse_ready_at_tick =
                                         -1;
                                 held_runtime->retarget_direction_locked = 1;
+                                held_runtime->last_accepted_sensor_node =
+                                        reversed;
+                                accepted_sensor_node = reversed;
                                 retarget_reverse_pending = 0;
                                 retarget_reverse_ready_at_tick = -1;
                                 retarget_direction_locked = 1;
+                                retarget_direction_anchor_node = reversed;
+                                retarget_direction_anchor_sequence =
+                                        held_runtime
+                                                ->retarget_direction_anchor_sequence;
                         }
                         /*
-                         * Both direction selection and the post-reverse
-                         * CURRENT route are anchored at the latest confirmed
-                         * real detector.  current_node may be an estimate near
-                         * the stopped body and is deliberately retained for
-                         * physical occupancy; it is not a safe direction
-                         * oracle for a new route.
+                         * Before any reverse, direction selection starts at
+                         * the latest confirmed real detector.  Once reverse
+                         * is acknowledged, the saved directed anchor is the
+                         * only route origin: later old-route monitor events
+                         * must not apply physical_reverse_index() a second
+                         * time.  current_node remains only the occupancy pose.
                          */
-                        int confirmed_offset =
-                                held_runtime->monitor.confirmed_offset;
+                        int fixed_departure_origin =
+                                !held_runtime->retarget_reverse_pending &&
+                                !held_runtime->retarget_direction_locked &&
+                                cancel_anchor_is_trusted(oldest) &&
+                                held_job->current_node >= 0 &&
+                                held_job->current_node < TRACK_MAX &&
+                                dispatch_track[held_job->current_node].type ==
+                                        NODE_ENTER;
                         retarget_confirmed_start_node =
-                                confirmed_offset >= 0 &&
-                                confirmed_offset <
-                                        held_runtime->route.node_count ?
-                                held_runtime->route.nodes[
-                                        confirmed_offset] : -1;
+                                retarget_direction_anchor_node >= 0 ?
+                                retarget_direction_anchor_node :
+                                (accepted_sensor_node >= 0 &&
+                                 accepted_sensor_node < TRACK_MAX &&
+                                 dispatch_track[accepted_sensor_node].type ==
+                                         NODE_SENSOR ?
+                                 accepted_sensor_node :
+                                 (fixed_departure_origin ?
+                                  held_job->current_node : -1));
                         if (retarget_confirmed_start_node < 0 ||
-                            dispatch_track[
-                                    retarget_confirmed_start_node].type !=
-                                    NODE_SENSOR) {
+                            retarget_confirmed_start_node >= TRACK_MAX ||
+                            (dispatch_track[
+                                     retarget_confirmed_start_node].type !=
+                                     NODE_SENSOR &&
+                             !fixed_departure_origin)) {
                                 held_runtime->lifecycle_stop_reason =
                                         TC2_LIFECYCLE_STOP_UNCONFIRMED;
                                 continue;
                         }
                         if (held_runtime->retarget_direction_locked) {
                                 retarget_reversed_start_node =
-                                        physical_reverse_index(
-                                                retarget_confirmed_start_node);
+                                        retarget_direction_anchor_node;
                                 if (retarget_reversed_start_node < 0 ||
                                     dispatch_track[
                                             retarget_reversed_start_node].type !=
@@ -22553,6 +22764,10 @@ static void process_pending_retargets(int now) {
                                 .reroute_select_direction = 0;
                         dispatch_runtime[oldest]
                                 .retarget_direction_locked = 0;
+                        dispatch_runtime[oldest]
+                                .retarget_direction_anchor_node = -1;
+                        dispatch_runtime[oldest]
+                                .retarget_direction_anchor_sequence = 0;
                         continue;
                 }
 
@@ -22612,31 +22827,71 @@ static void process_pending_retargets(int now) {
                                         queue_sequence,
                                         launch_epoch,
                                         retarget_force_reverse_first,
-                                        1, 0, -1, 0);
+                                        1, 0, -1, 0,
+                                        -1, 0);
                                 dispatch_runtime[oldest]
                                                 .lifecycle_stop_reason =
                                         TC2_LIFECYCLE_STOP_REROUTE;
                                 dispatch_jobs[oldest].conflict_train = 0;
                                 dispatch_jobs[oldest].conflict_node = -1;
                                 if (dispatch_jobs[oldest].command_speed != 0 ||
-                                    dispatch_runtime[oldest].command_speed != 0 ||
-                                    CanTrainReversePriority(
-                                            dispatch_can_tid,
-                                            request.train) < 0) {
+                                    dispatch_runtime[oldest].command_speed != 0) {
                                         dispatch_runtime[oldest]
                                                         .lifecycle_stop_reason =
                                                 TC2_LIFECYCLE_STOP_UNCONFIRMED;
-                                        clear_pending_retarget(
-                                                &dispatch_runtime[oldest]);
+                                        continue;
+                                }
+                                int reverse_anchor_node =
+                                        physical_reverse_index(
+                                                retarget_confirmed_start_node);
+                                if (retarget_confirmed_start_node < 0 ||
+                                    reverse_anchor_node < 0 ||
+                                    reverse_anchor_node >= TRACK_MAX ||
+                                    dispatch_track[
+                                            retarget_confirmed_start_node].type !=
+                                            NODE_SENSOR ||
+                                    dispatch_track[reverse_anchor_node].type !=
+                                            NODE_SENSOR) {
+                                        dispatch_runtime[oldest]
+                                                        .lifecycle_stop_reason =
+                                                TC2_LIFECYCLE_STOP_UNCONFIRMED;
+                                        continue;
+                                }
+                                if (CanTrainReversePriority(
+                                            dispatch_can_tid,
+                                            request.train) < 0) {
+                                        /* Keep the zero-speed request armed. */
+                                        dispatch_runtime[oldest]
+                                                        .lifecycle_stop_reason =
+                                                TC2_LIFECYCLE_STOP_REROUTE;
                                         continue;
                                 }
                                 int reverse_confirmed = Time();
                                 if (reverse_confirmed < 0) {
+                                        /*
+                                         * Reverse was acknowledged and cannot
+                                         * be rolled back.  Retain that physical
+                                         * phase with an unknown deadline; a
+                                         * later valid tick establishes a full
+                                         * settle delay before route planning.
+                                         */
+                                        dispatch_runtime[oldest]
+                                                .retarget_reverse_pending = 1;
+                                        dispatch_runtime[oldest]
+                                                .retarget_reverse_ready_at_tick =
+                                                -1;
+                                        dispatch_runtime[oldest]
+                                                .retarget_direction_locked = 0;
+                                        dispatch_runtime[oldest]
+                                                .retarget_direction_anchor_node =
+                                                reverse_anchor_node;
+                                        dispatch_runtime[oldest]
+                                                .retarget_direction_anchor_sequence =
+                                                dispatch_runtime[oldest]
+                                                        .last_accepted_sensor_sequence;
                                         dispatch_runtime[oldest]
                                                         .lifecycle_stop_reason =
-                                                TC2_LIFECYCLE_STOP_UNCONFIRMED;
-                                        clear_pending_retarget(
-                                                &dispatch_runtime[oldest]);
+                                                TC2_LIFECYCLE_STOP_REROUTE;
                                         continue;
                                 }
                                 dispatch_runtime[oldest]
@@ -22648,23 +22903,39 @@ static void process_pending_retargets(int now) {
                                                 TC2_REVERSE_SETTLE_TICKS);
                                 dispatch_runtime[oldest]
                                                 .retarget_direction_locked = 0;
+                                dispatch_runtime[oldest]
+                                                .retarget_direction_anchor_node =
+                                        reverse_anchor_node;
+                                dispatch_runtime[oldest]
+                                                .retarget_direction_anchor_sequence =
+                                        dispatch_runtime[oldest]
+                                                .last_accepted_sensor_sequence;
                                 continue;
                         }
                         if (staged < 0 || prepared < 0) {
                                 /*
-                                 * Service/CAN availability is retryable.  The
-                                 * byte-for-byte rollback above restored the
-                                 * bounded zero-speed body and armed request, so
-                                 * keep both and retry on a later scheduler tick.
-                                 * Only a deterministic route/state invariant
-                                 * failure invalidates this request.
+                                 * The byte-for-byte rollback restored the
+                                 * bounded zero-speed body and armed request.
+                                 * A public reroute is durable operator intent:
+                                 * route availability, localization, or a
+                                 * transient internal admission failure may
+                                 * delay it but may not silently cancel it.
+                                 * Internal automatic traffic retargets retain
+                                 * their older deterministic-failure policy.
                                  */
-                                if (candidate_failure_reason ==
-                                            TC2_FAILURE_ROUTE ||
-                                    candidate_failure_reason ==
-                                            TC2_FAILURE_SENSOR_SEQUENCE ||
-                                    candidate_failure_reason ==
-                                            TC2_FAILURE_INTERNAL) {
+                                if (retarget_operator_reroute) {
+                                        dispatch_runtime[oldest]
+                                                        .lifecycle_stop_reason =
+                                                candidate_failure_reason ==
+                                                        TC2_FAILURE_SENSOR_SEQUENCE ?
+                                                TC2_LIFECYCLE_STOP_UNCONFIRMED :
+                                                TC2_LIFECYCLE_STOP_REROUTE;
+                                } else if (candidate_failure_reason ==
+                                                   TC2_FAILURE_ROUTE ||
+                                           candidate_failure_reason ==
+                                                   TC2_FAILURE_SENSOR_SEQUENCE ||
+                                           candidate_failure_reason ==
+                                                   TC2_FAILURE_INTERNAL) {
                                         clear_pending_retarget(
                                                 &dispatch_runtime[oldest]);
                                 } else {
@@ -22683,15 +22954,73 @@ static void process_pending_retargets(int now) {
                  * old generation with new ownership, so retain the new state
                  * and emergency-stop it.
                  */
-                clear_pending_retarget(
-                        &dispatch_runtime[oldest]);
-                if (dispatch_jobs[oldest].state !=
-                            TC2_JOB_FAILED) {
-                        fail_job(
-                                oldest,
-                                have_after ?
-                                TC2_FAILURE_INTERNAL :
-                                TC2_FAILURE_RESERVATION_SERVICE);
+                unsigned int retry_generation =
+                        have_after ?
+                        after.generation_by_train[request.train] :
+                        dispatch_jobs[oldest].plan_generation;
+                int retry_destination =
+                        have_after ?
+                        after.destination_by_train[request.train] :
+                        dispatch_jobs[oldest].target_node;
+                /*
+                 * Candidate fail_job() calls made while the transaction flag
+                 * was set were intentionally memory-only.  The CAS is now
+                 * authoritative, so execute a real fail-closed stop and retire
+                 * any candidate future CAN/conflict work before retrying.
+                 */
+                fail_job(
+                        oldest,
+                        have_after ?
+                        TC2_FAILURE_INTERNAL :
+                        TC2_FAILURE_RESERVATION_SERVICE);
+                int public_retry_allowed =
+                        retarget_operator_reroute &&
+                        dispatch_jobs[oldest].state != TC2_JOB_EMPTY &&
+                        dispatch_runtime[oldest]
+                                        .lifecycle_stop_reason !=
+                                TC2_LIFECYCLE_STOP_REMOVE_PENDING;
+                if (public_retry_allowed) {
+                        /*
+                         * A post-CAS projection/CAN failure invalidates this
+                         * candidate, not the operator's destination.  If the
+                         * replacement generation is known, atomically shrink
+                         * it back to the saved bounded body before retrying.
+                         * Never pair the new owner generation with an old
+                         * route or future next/nextnext cursor.
+                         */
+                        int body_recovered =
+                                have_after &&
+                                recover_post_cas_public_retarget_body(
+                                        oldest, retry_generation,
+                                        retry_destination, now) == 0;
+                        restore_pending_retarget(
+                                &dispatch_runtime[oldest],
+                                retarget_speed,
+                                retarget_destination,
+                                retry_generation,
+                                retry_destination,
+                                queue_sequence,
+                                launch_epoch,
+                                retarget_force_reverse_first,
+                                1,
+                                retarget_reverse_pending,
+                                retarget_reverse_ready_at_tick,
+                                retarget_direction_locked,
+                                retarget_direction_anchor_node,
+                                retarget_direction_anchor_sequence);
+                        int trusted_failed_candidate =
+                                dispatch_runtime[oldest].route_valid &&
+                                dispatch_jobs[oldest].current_node >= 0 &&
+                                cancel_anchor_is_trusted(oldest);
+                        dispatch_runtime[oldest]
+                                        .lifecycle_stop_reason =
+                                body_recovered ||
+                                        trusted_failed_candidate ?
+                                TC2_LIFECYCLE_STOP_REROUTE :
+                                TC2_LIFECYCLE_STOP_UNCONFIRMED;
+                } else {
+                        clear_pending_retarget(
+                                &dispatch_runtime[oldest]);
                 }
         }
 }
@@ -23743,6 +24072,11 @@ static void dispatch_server_core(void) {
         dispatch_batch_ready_at_tick = -1;
         dispatch_scheduler_healthy = 0;
         dispatch_heartbeat = 0;
+        dispatch_can_heartbeat_valid = 0;
+        dispatch_can_tx_heartbeat = 0;
+        dispatch_can_rx_heartbeat = 0;
+        dispatch_can_tx_heartbeat_tick = -1;
+        dispatch_can_rx_heartbeat_tick = -1;
         dispatch_last_logical_time = -1;
         dispatch_supervisor_trip = 0;
         dispatch_last_progress_usec = timer_get_usec();
@@ -23822,6 +24156,12 @@ static void dispatch_server_core(void) {
                         continue;
                 }
 
+                int recovery_reroute_intent =
+                        request.type == TC2_DISPATCH_MSG_STAGE &&
+                        request.start_index ==
+                                TC2_DISPATCH_START_CURRENT &&
+                        (request.reserved &
+                         TC2_DISPATCH_REQUEST_OPERATOR_REROUTE) != 0;
                 int allowed_while_unhealthy =
                         request.type == TC2_DISPATCH_MSG_SNAPSHOT ||
                         request.type == TC2_DISPATCH_MSG_CANCEL ||
@@ -23834,7 +24174,8 @@ static void dispatch_server_core(void) {
                                 TC2_DISPATCH_MSG_PROJECTION_HEADER ||
                         request.type ==
                                 TC2_DISPATCH_MSG_PROJECTION_PAGE ||
-                        request.type == TC2_DISPATCH_MSG_TICK;
+                        request.type == TC2_DISPATCH_MSG_TICK ||
+                        recovery_reroute_intent;
                 if (!dispatch_scheduler_healthy &&
                     !allowed_while_unhealthy) {
                         Reply(sender, (const char *)&reply,
@@ -23871,6 +24212,37 @@ static void dispatch_server_core(void) {
                                                     .retarget_pending &&
                                             !dispatch_runtime[slot]
                                                     .retarget_armed) {
+                                                if (dispatch_jobs[slot].state ==
+                                                            TC2_JOB_EMPTY ||
+                                                    dispatch_runtime[slot]
+                                                                    .lifecycle_stop_reason ==
+                                                            TC2_LIFECYCLE_STOP_REMOVE_PENDING) {
+                                                        clear_pending_retarget(
+                                                                &dispatch_runtime[slot]);
+                                                        continue;
+                                                }
+                                                /*
+                                                 * Sensor attribution, arrival,
+                                                 * and a fail-closed stop may
+                                                 * legitimately restage the live
+                                                 * reservation after `reroute`
+                                                 * was typed.  Bind an operator
+                                                 * command to that current safe
+                                                 * body when `go` arms it; the
+                                                 * destination/speed intent is
+                                                 * newer than the retired route.
+                                                 */
+                                                if (dispatch_runtime[slot]
+                                                            .retarget_operator_reroute) {
+                                                        dispatch_runtime[slot]
+                                                                .retarget_expected_generation =
+                                                                dispatch_jobs[slot]
+                                                                        .plan_generation;
+                                                        dispatch_runtime[slot]
+                                                                .retarget_expected_destination =
+                                                                dispatch_jobs[slot]
+                                                                        .target_node;
+                                                }
                                                 ++dispatch_queue_sequence;
                                                 if (dispatch_queue_sequence ==
                                                     0) {
@@ -23986,6 +24358,40 @@ static void dispatch_server_core(void) {
                         Reply(sender,
                               (const char *)&projection_page,
                               sizeof(projection_page));
+                } else if (request.type ==
+                           TC2_DISPATCH_MSG_DEMO_TURNOUT_BATCH) {
+                        int switches[4];
+                        char directions[4];
+                        int ordinary_jobs = 0;
+                        int count = request.train;
+                        for (int slot = 0;
+                             slot < TC2_DISPATCH_MAX_JOBS; ++slot) {
+                                if (dispatch_jobs[slot].state !=
+                                    TC2_JOB_EMPTY) {
+                                        ordinary_jobs = 1;
+                                        break;
+                                }
+                        }
+                        switches[0] = request.start_index;
+                        switches[1] = request.speed;
+                        switches[2] = request.destination_index;
+                        switches[3] = request.node_index;
+                        directions[0] =
+                                (char)(request.reserved & 0xffu);
+                        directions[1] =
+                                (char)((request.reserved >> 8) & 0xffu);
+                        directions[2] =
+                                (char)((request.reserved >> 16) & 0xffu);
+                        directions[3] =
+                                (char)((request.reserved >> 24) & 0xffu);
+                        if (!ordinary_jobs && count >= 1 && count <= 4) {
+                                reply.status = initialize_turnout_batch(
+                                        switches, directions, count);
+                                reply.affected =
+                                        reply.status == 0 ? count : 0;
+                        }
+                        Reply(sender, (const char *)&reply,
+                              sizeof(reply));
                 } else if (request.type ==
                            TC2_DISPATCH_MSG_TICK) {
                         ++dispatch_heartbeat;

@@ -38,6 +38,85 @@ static uint32_t tc2_ui_next_render_tick;
 static char tc2_ui_status[192];
 static char tc2_ui_restore[TC2_UI_TX_RESTORE_CAPACITY];
 static int tc2_ui_status_dirty = 1;
+
+#define TC2_DEMO_TRAIN_COUNT 3
+#define TC2_DEMO_MINIMUM_RUNTIME_TICKS 18000u
+#define TC2_DEMO_STOP_DWELL_TICKS 200u
+#define TC2_DEMO_REVERSE_SETTLE_TICKS 200u
+#define TC2_DEMO_WAIT_TURNOUT_TICKS 200u
+#define TC2_DEMO_SENSOR_TIMEOUT_TICKS 6000u
+#define TC2_DEMO_SENSOR_RECOVERY_DWELL_TICKS 100u
+#define TC2_DEMO_MAX_SENSOR_RECOVERY_RESTARTS 2u
+#define TC2_DEMO_SENSOR_FAILURE_LIMIT 20u
+#define TC2_DEMO_POLL_TICKS 5u
+#define TC2_DEMO_MAX_ROUTE_SENSORS 10
+#define TC2_DEMO_MAX_LEG_SWITCHES 8
+#define TC2_DEMO_TURNOUT_BATCH_LIMIT 4
+#define TC2_DEMO_ENDPOINT_TRIM_SPEED 40
+#define TC2_DEMO_ENDPOINT_BRAKE_SETTLE_TICKS 200u
+#define TC2_DEMO_T17_RELEASE_CLEARANCE_MM 1800
+#define TC2_DEMO_T15_RETURN_DWELL_TICKS 1500u
+#define TC2_DEMO_UI_SEGMENT_DISTANCE_MM 500
+#define TC2_DEMO_UI_PROGRESS_SCALE 1000u
+#define TC2_DEMO_UI_UNCONFIRMED_LIMIT 900u
+
+typedef enum {
+        TC2_DEMO_IDLE = 0,
+        TC2_DEMO_INITIAL_STOPPING,
+        TC2_DEMO_WAIT_TURNOUT,
+        TC2_DEMO_RUNNING,
+        TC2_DEMO_STOPPED,
+        TC2_DEMO_REVERSING,
+        TC2_DEMO_ENDPOINT_TRIM_STOPPED,
+        TC2_DEMO_ENDPOINT_TRIM_RUNNING,
+        TC2_DEMO_SENSOR_RECOVERY,
+        TC2_DEMO_PAUSED
+} tc2_demo_phase;
+
+typedef struct {
+        int active;
+        int initializing;
+        int profile_id;
+        uint32_t started_tick;
+        uint32_t next_poll_tick;
+        unsigned int initial_stop_token;
+        unsigned int action_count;
+        unsigned int route_armed_mask[TC2_DEMO_TRAIN_COUNT];
+        unsigned int sensor_recovery_restarts[TC2_DEMO_TRAIN_COUNT];
+        unsigned int sensor_failure_count;
+        unsigned int completed_cycles[TC2_DEMO_TRAIN_COUNT];
+        int phase[TC2_DEMO_TRAIN_COUNT];
+        uint32_t phase_started_tick[TC2_DEMO_TRAIN_COUNT];
+        uint32_t wait_until_tick[TC2_DEMO_TRAIN_COUNT];
+        unsigned int pending_batch_token[TC2_DEMO_TRAIN_COUNT];
+        unsigned char outbound_leg[TC2_DEMO_TRAIN_COUNT];
+        unsigned char first_departure[TC2_DEMO_TRAIN_COUNT];
+        int route_sensor_cursor[TC2_DEMO_TRAIN_COUNT];
+        unsigned int ui_plan_generation[TC2_DEMO_TRAIN_COUNT];
+	unsigned int ui_position_revision[TC2_DEMO_TRAIN_COUNT];
+	unsigned int ui_sensor_sequence[TC2_DEMO_TRAIN_COUNT];
+	uint32_t ui_segment_started_tick[TC2_DEMO_TRAIN_COUNT];
+	unsigned int ui_segment_progress[TC2_DEMO_TRAIN_COUNT];
+	int ui_segment_anchor_sensor[TC2_DEMO_TRAIN_COUNT];
+	int ui_segment_anchor_row[TC2_DEMO_TRAIN_COUNT];
+	int ui_segment_anchor_column[TC2_DEMO_TRAIN_COUNT];
+	unsigned char resume_after_wait[TC2_DEMO_TRAIN_COUNT];
+	unsigned char reverse_after_wait[TC2_DEMO_TRAIN_COUNT];
+	unsigned char deferred_initial_prepare[TC2_DEMO_TRAIN_COUNT];
+	unsigned char station_stop[TC2_DEMO_TRAIN_COUNT];
+	unsigned char return_leg_started[TC2_DEMO_TRAIN_COUNT];
+	uint32_t motion_account_tick[TC2_DEMO_TRAIN_COUNT];
+	uint32_t return_running_ticks[TC2_DEMO_TRAIN_COUNT];
+	uint32_t return_prepare_release_tick[TC2_DEMO_TRAIN_COUNT];
+        int last_running;
+        int last_waiting;
+        int last_stopped;
+        int last_reversing;
+        int last_elapsed_seconds;
+        int last_phase[TC2_DEMO_TRAIN_COUNT];
+} tc2_physical_demo;
+
+static tc2_physical_demo tc2_demo_state;
 #endif
 
 #ifndef MODE_TC2
@@ -519,6 +598,1725 @@ static size_t tc2_build_prompt_restore(const char *line, int line_length) {
                 tc2_ui_restore, sizeof(tc2_ui_restore), length,
                 "\033[?25h");
         return length;
+}
+
+static int tc2_demo_trains[TC2_DEMO_TRAIN_COUNT] = {
+        14, 15, 17
+};
+
+typedef struct {
+        int speed;
+        int endpoint_trim_outbound_mm[TC2_DEMO_TRAIN_COUNT];
+        int endpoint_trim_return_mm[TC2_DEMO_TRAIN_COUNT];
+        int first_outbound_sensors[TC2_DEMO_TRAIN_COUNT]
+                                  [TC2_DEMO_MAX_ROUTE_SENSORS];
+        int first_outbound_count[TC2_DEMO_TRAIN_COUNT];
+        int outbound_sensors[TC2_DEMO_TRAIN_COUNT]
+                            [TC2_DEMO_MAX_ROUTE_SENSORS];
+        int outbound_count[TC2_DEMO_TRAIN_COUNT];
+        int return_sensors[TC2_DEMO_TRAIN_COUNT]
+                          [TC2_DEMO_MAX_ROUTE_SENSORS];
+        int return_count[TC2_DEMO_TRAIN_COUNT];
+        int first_outbound_station_cursor[TC2_DEMO_TRAIN_COUNT];
+        int outbound_station_cursor[TC2_DEMO_TRAIN_COUNT];
+        int return_station_cursor[TC2_DEMO_TRAIN_COUNT];
+        uint32_t endpoint_dwell_ticks[TC2_DEMO_TRAIN_COUNT];
+        uint32_t initial_launch_stagger_ticks[TC2_DEMO_TRAIN_COUNT];
+        int outbound_switch_count[TC2_DEMO_TRAIN_COUNT];
+        int outbound_switches[TC2_DEMO_TRAIN_COUNT]
+                             [TC2_DEMO_MAX_LEG_SWITCHES];
+        char outbound_directions[TC2_DEMO_TRAIN_COUNT]
+                                [TC2_DEMO_MAX_LEG_SWITCHES];
+        int return_switch_count[TC2_DEMO_TRAIN_COUNT];
+        int return_switches[TC2_DEMO_TRAIN_COUNT]
+                           [TC2_DEMO_MAX_LEG_SWITCHES];
+        char return_directions[TC2_DEMO_TRAIN_COUNT]
+                              [TC2_DEMO_MAX_LEG_SWITCHES];
+        int ui_destinations[TC2_DEMO_TRAIN_COUNT];
+        int initial_completion_dependency[TC2_DEMO_TRAIN_COUNT];
+        int initial_dependency_release_cursor[TC2_DEMO_TRAIN_COUNT];
+        int return_prepare_dependency[TC2_DEMO_TRAIN_COUNT];
+        int return_prepare_release_cursor[TC2_DEMO_TRAIN_COUNT];
+        int return_prepare_wait_for_return[TC2_DEMO_TRAIN_COUNT];
+        int return_prepare_wait_for_endpoint[TC2_DEMO_TRAIN_COUNT];
+        unsigned int return_prepare_completion_mask[TC2_DEMO_TRAIN_COUNT];
+        int outbound_final_approach_speed[TC2_DEMO_TRAIN_COUNT];
+        int return_final_approach_speed[TC2_DEMO_TRAIN_COUNT];
+	int return_correction_stop_cursor[TC2_DEMO_TRAIN_COUNT];
+	int return_correction_speed[TC2_DEMO_TRAIN_COUNT];
+        int defer_third_train;
+        int third_train_release_clearance_mm;
+} tc2_demo_profile;
+
+enum {
+        TC2_DEMO_PROFILE_INTERSECTIONS = 0,
+        TC2_DEMO_PROFILE_DESTINATIONS = 1,
+        TC2_DEMO_PROFILE_COUNT = 2
+};
+
+/*
+ * Both profiles are fixed physical scripts.  Detector values are directed
+ * Track-D indices; the runtime accepts either member of each physical pair.
+ * Every return list is the exact reverse physical corridor of its outbound
+ * list, and every return turnout batch preserves the same physical route.
+ */
+static const tc2_demo_profile tc2_demo_profiles[TC2_DEMO_PROFILE_COUNT] = {
+        {
+                .speed = 60,
+                .endpoint_trim_outbound_mm = {90, 40, 90},
+                .endpoint_trim_return_mm = {90, 40, 90},
+                .first_outbound_sensors = {
+                        {0, 44, 70, 54, 56, 75, 58, 47, -1, -1},
+                        {22, 9, 38, -1, -1, -1, -1, -1, -1, -1},
+                        {35, 37, 30, -1, -1, -1, -1, -1, -1, -1}
+                },
+                .first_outbound_count = {8, 3, 3},
+                .outbound_sensors = {
+                        {44, 70, 54, 56, 75, 58, 47, -1, -1, -1},
+                        {38, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+                        {37, 30, -1, -1, -1, -1, -1, -1, -1, -1}
+                },
+                .outbound_count = {7, 1, 2},
+                .return_sensors = {
+                        {46, 59, 74, 57, 55, 71, 45, 1, -1, -1},
+                        {8, -1, -1, -1, -1, -1, -1, -1, -1, -1},
+                        {36, 34, -1, -1, -1, -1, -1, -1, -1, -1}
+                },
+                .return_count = {8, 1, 2},
+                .first_outbound_station_cursor = {2, -1, 1},
+                .outbound_station_cursor = {1, -1, 0},
+                .return_station_cursor = {2, -1, 0},
+                .endpoint_dwell_ticks = {300u, 500u, 400u},
+                .initial_launch_stagger_ticks = {0u, 600u, 0u},
+                .outbound_switch_count = {2, 0, 1},
+                .outbound_switches = {
+                        {8, 7, 0, 0}, {0, 0, 0, 0}, {18, 0, 0, 0}
+                },
+                .outbound_directions = {
+                        {'S', 'S', 0, 0}, {0, 0, 0, 0}, {'C', 0, 0, 0}
+                },
+                .return_switch_count = {3, 3, 3},
+                .return_switches = {
+                        {9, 11, 12, 0}, {3, 2, 1, 0}, {15, 6, 5, 0}
+                },
+                .return_directions = {
+                        {'S', 'S', 'S', 0}, {'C', 'S', 'C', 0},
+                        {'S', 'C', 'S', 0}
+                },
+                .ui_destinations = {5, 3, 1},
+                .initial_completion_dependency = {-1, -1, -1},
+                .initial_dependency_release_cursor = {-1, -1, -1},
+                .return_prepare_dependency = {-1, -1, -1},
+                .return_prepare_release_cursor = {-1, -1, -1},
+                .return_prepare_wait_for_return = {0, 0, 0},
+                .return_prepare_wait_for_endpoint = {0, 0, 0},
+                .return_prepare_completion_mask = {0u, 0u, 0u},
+                .outbound_final_approach_speed = {0, 0, 0},
+                .return_final_approach_speed = {0, 0, 0},
+		.return_correction_stop_cursor = {-1, -1, -1},
+		.return_correction_speed = {0, 0, 0},
+                .defer_third_train = 1,
+                .third_train_release_clearance_mm =
+                        TC2_DEMO_T17_RELEASE_CLEARANCE_MM
+        },
+        {
+                .speed = 80,
+                /* T14 stops at its final detector; no extra d4 trim pulse. */
+                .endpoint_trim_outbound_mm = {0, 254, 381},
+                /*
+                 * T14 returns to A at the final physical detector.  Do not
+                 * add a timed trim pulse after that detector: at speed 40 it
+                 * was carrying the train beyond the scripted endpoint.
+                 */
+                .endpoint_trim_return_mm = {0, 0, 140},
+                .first_outbound_sensors = {
+                        /* A -> d4: A1,C13,E7,D7,E10,E13,D13,B2. */
+                        {0, 44, 70, 54, 73, 76, 60, 17, -1, -1},
+                        /* C -> d3: B7,A10,C7,E11,D10,D5,E6,D4,B6. */
+                        {22, 9, 38, 74, 57, 52, 69, 51, 21, -1},
+                        /* F -> d1: C4,C8,A12. */
+                        {35, 39, 11, -1, -1, -1, -1, -1, -1, -1}
+                },
+                .first_outbound_count = {8, 9, 3},
+                .outbound_sensors = {
+                        {44, 70, 54, 73, 76, 60, 17, -1, -1, -1},
+                        {9, 38, 74, 57, 52, 69, 51, 21, -1, -1},
+                        {39, 11, -1, -1, -1, -1, -1, -1, -1, -1}
+                },
+                .outbound_count = {7, 8, 2},
+                .return_sensors = {
+                        /* d4 -> A. */
+                        {16, 61, 77, 72, 55, 71, 45, 1, -1, -1},
+                        /* d3 -> C. */
+			{20, 50, 68, 53, 56, 75, 39, 8, -1, -1},
+                        /* d1 -> F. */
+                        {10, 38, 34, -1, -1, -1, -1, -1, -1, -1}
+                },
+		.return_count = {8, 8, 3},
+                .first_outbound_station_cursor = {2, 2, 1},
+                .outbound_station_cursor = {1, 1, 0},
+                .return_station_cursor = {2, 3, 1},
+                /*
+                 * T15 remains stopped at d3 for fifteen seconds, then the
+                 * fixed script prepares its complete return turnout batch.
+                 * This profile deliberately uses elapsed choreography rather
+                 * than waiting for peer completion bookkeeping.
+                 */
+                .endpoint_dwell_ticks = {
+                        300u, TC2_DEMO_T15_RETURN_DWELL_TICKS, 500u
+                },
+                .initial_launch_stagger_ticks = {0u, 0u, 0u},
+                .outbound_switch_count = {2, 3, 4},
+                .outbound_switches = {
+                        {8, 17, 0, 0}, {5, 9, 10, 0}, {18, 3, 2, 1}
+                },
+                .outbound_directions = {
+                        {'C', 'S', 0, 0}, {'C', 'C', 'S', 0},
+                        {'S', 'C', 'S', 'S'}
+                },
+                /*
+                 * T15 takes the complete d3 -> C return corridor through
+                 * SW13/8/7/18/3/2/1.  Prepare the entire fixed batch before
+                 * reverse so the scripted train cannot inherit a turnout
+                 * left behind by T14 or T17.  The normal two-second settle
+                 * window remains mandatory before motion.
+                 *
+                 * T17 returns through SW5 after T15 has cleared it.  SW5 is
+                 * the branch that selects the route back to F, so it must be
+                 * commanded straight and settled before reversing.
+                 */
+                .return_switch_count = {3, 7, 1},
+                .return_switches = {
+                        {9, 11, 12},
+                        {13, 8, 7, 18, 3, 2, 1},
+                        {5}
+                },
+                .return_directions = {
+                        {'S', 'S', 'S'},
+                        {'S', 'S', 'C', 'S', 'C', 'S', 'C'},
+                        {'S'}
+                },
+                .ui_destinations = {3, 2, 0},
+                /*
+                 * T15's d3 corridor shares the SW8 throat with T14.  E10
+                 * only confirms that T14's head has passed the throat; its
+                 * tail can still be over the turnout when T15 starts its
+                 * switch batch.  Hold T15 until T14 reaches E13, the next
+                 * real detector, so the complete train has cleared before
+                 * another route is allowed to move the shared turnouts.
+                 * This still avoids waiting for T14's complete d4 -> A
+                 * cycle.
+                 */
+                .initial_completion_dependency = {-1, 0, -1},
+                .initial_dependency_release_cursor = {-1, 6, -1},
+                /*
+		 * T15's return cursor reaches 8 at A9/A10, the scripted final
+		 * detector.  That is the release boundary for the other return
+		 * legs; this fake profile deliberately does not chase B7/B8.
+                 * T15 prepares its own complete return switch batch after its
+                 * fixed fifteen-second endpoint dwell.
+                 */
+                .return_prepare_dependency = {1, -1, 1},
+		.return_prepare_release_cursor = {8, -1, 8},
+                .return_prepare_wait_for_return = {0, 0, 0},
+                .return_prepare_wait_for_endpoint = {1, 0, 1},
+                .return_prepare_completion_mask = {0u, 0u, 0u},
+                /*
+                 * Slow T14 before B2 and T15 before B6.  The detector still
+                 * remains the authoritative trim anchor, but reaching it at
+                 * 40 avoids adding an uncontrolled speed-80 coast to the
+                 * measured endpoint offset.
+                 */
+                .outbound_final_approach_speed = {40, 50, 0},
+                /*
+                 * Return endpoints are approached at low speed so the stop
+                 * issued by their final real detector does not coast T14 or
+                 * T15 beyond A/C/F.  T17 then receives only its measured,
+                 * bounded 140 mm terminal trim.
+                 */
+                .return_final_approach_speed = {40, 40, 40},
+		/*
+		 * T15's d3 -> C return enters its final correction corridor at
+		 * C7/C8 (cursor 6).  Stop there, then pass A9/A10 at speed 40;
+		 * A9/A10 is the terminal detector and immediately issues zero.
+		 */
+		.return_correction_stop_cursor = {-1, 6, -1},
+		.return_correction_speed = {0, 40, 0},
+                .defer_third_train = 0,
+                .third_train_release_clearance_mm = 0
+        }
+};
+
+static const int tc2_demo_starts[TC2_DEMO_TRAIN_COUNT] = {
+        0, 2, 5 /* A, C, F */
+};
+
+static const tc2_demo_profile *tc2_demo_profile_config(void) {
+        int profile = tc2_demo_state.profile_id;
+        if (profile < 0 || profile >= TC2_DEMO_PROFILE_COUNT) {
+                profile = TC2_DEMO_PROFILE_INTERSECTIONS;
+        }
+        return &tc2_demo_profiles[profile];
+}
+
+static int tc2_demo_leg_speed(int slot) {
+	const tc2_demo_profile *profile = tc2_demo_profile_config();
+	int stop_cursor;
+
+	if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) {
+		return profile->speed;
+	}
+	stop_cursor = profile->return_correction_stop_cursor[slot];
+	if (!tc2_demo_state.outbound_leg[slot] && stop_cursor >= 0 &&
+	    tc2_demo_state.route_sensor_cursor[slot] > stop_cursor &&
+	    profile->return_correction_speed[slot] > 0) {
+		return profile->return_correction_speed[slot];
+	}
+	return profile->speed;
+}
+
+static int tc2_demo_is_return_correction_stop(
+	int slot, int matched_cursor) {
+	const tc2_demo_profile *profile = tc2_demo_profile_config();
+
+	return slot >= 0 && slot < TC2_DEMO_TRAIN_COUNT &&
+	       !tc2_demo_state.outbound_leg[slot] &&
+	       profile->return_correction_stop_cursor[slot] >= 0 &&
+	       matched_cursor == profile->return_correction_stop_cursor[slot];
+}
+
+
+static void tc2_demo_reset_state(void) {
+        tc2_demo_state.active = 0;
+        tc2_demo_state.initializing = 0;
+        tc2_demo_state.profile_id = TC2_DEMO_PROFILE_INTERSECTIONS;
+        tc2_demo_state.started_tick = 0;
+        tc2_demo_state.next_poll_tick = 0;
+        tc2_demo_state.initial_stop_token = 0;
+        tc2_demo_state.action_count = 0;
+        tc2_demo_state.sensor_failure_count = 0;
+        tc2_demo_state.last_running = -1;
+        tc2_demo_state.last_waiting = -1;
+        tc2_demo_state.last_stopped = -1;
+        tc2_demo_state.last_reversing = -1;
+        tc2_demo_state.last_elapsed_seconds = -1;
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                tc2_demo_state.completed_cycles[slot] = 0;
+                tc2_demo_state.phase[slot] = TC2_DEMO_IDLE;
+                tc2_demo_state.phase_started_tick[slot] = 0;
+                tc2_demo_state.wait_until_tick[slot] = 0;
+                tc2_demo_state.pending_batch_token[slot] = 0;
+                tc2_demo_state.outbound_leg[slot] = 1;
+                tc2_demo_state.first_departure[slot] = 1;
+                tc2_demo_state.route_sensor_cursor[slot] = 0;
+                tc2_demo_state.route_armed_mask[slot] = 0;
+                tc2_demo_state.sensor_recovery_restarts[slot] = 0;
+                tc2_demo_state.ui_plan_generation[slot] =
+                        (unsigned int)(slot + 1);
+                tc2_demo_state.ui_position_revision[slot] = 0;
+		tc2_demo_state.ui_sensor_sequence[slot] = 0;
+		tc2_demo_state.ui_segment_started_tick[slot] = 0;
+		tc2_demo_state.ui_segment_progress[slot] = 0;
+		tc2_demo_state.ui_segment_anchor_sensor[slot] = -1;
+		tc2_demo_state.ui_segment_anchor_row[slot] = -1;
+		tc2_demo_state.ui_segment_anchor_column[slot] = -1;
+		tc2_demo_state.resume_after_wait[slot] = 0;
+		tc2_demo_state.reverse_after_wait[slot] = 0;
+		tc2_demo_state.deferred_initial_prepare[slot] = 0;
+		tc2_demo_state.station_stop[slot] = 0;
+		tc2_demo_state.return_leg_started[slot] = 0;
+		tc2_demo_state.motion_account_tick[slot] = 0;
+		tc2_demo_state.return_running_ticks[slot] = 0;
+		tc2_demo_state.return_prepare_release_tick[slot] = 0;
+                tc2_demo_state.last_phase[slot] = -1;
+        }
+}
+
+static const char *tc2_demo_phase_name(int phase) {
+        switch (phase) {
+        case TC2_DEMO_INITIAL_STOPPING:
+        case TC2_DEMO_STOPPED:
+        case TC2_DEMO_ENDPOINT_TRIM_STOPPED:
+        case TC2_DEMO_SENSOR_RECOVERY:
+        case TC2_DEMO_PAUSED:
+                return "STOPPED";
+        case TC2_DEMO_WAIT_TURNOUT:
+                return "WAIT_TURNOUT";
+        case TC2_DEMO_RUNNING:
+        case TC2_DEMO_ENDPOINT_TRIM_RUNNING:
+                return "RUNNING";
+        case TC2_DEMO_REVERSING:
+                return "REVERSING";
+        default:
+                return "IDLE";
+        }
+}
+
+static const int *tc2_demo_leg_sensors(int slot) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return 0;
+        if (!tc2_demo_state.outbound_leg[slot]) {
+                return profile->return_sensors[slot];
+        }
+        if (tc2_demo_state.first_departure[slot]) {
+                return profile->first_outbound_sensors[slot];
+        }
+        return profile->outbound_sensors[slot];
+}
+
+static int tc2_demo_leg_sensor_count(int slot) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return 0;
+        if (!tc2_demo_state.outbound_leg[slot]) {
+                return profile->return_count[slot];
+        }
+        if (tc2_demo_state.first_departure[slot]) {
+                return profile->first_outbound_count[slot];
+        }
+        return profile->outbound_count[slot];
+}
+
+static int tc2_demo_leg_station_cursor(int slot) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return -1;
+        if (!tc2_demo_state.outbound_leg[slot]) {
+                return profile->return_station_cursor[slot];
+        }
+        if (tc2_demo_state.first_departure[slot]) {
+                return profile->first_outbound_station_cursor[slot];
+        }
+        return profile->outbound_station_cursor[slot];
+}
+
+static int tc2_demo_sensor_pair_active(
+        const train_sensor_snapshot_t *sensors, int sensor) {
+        int first = sensor & ~1;
+        if (!sensors || first < 0 ||
+            first + 1 >= TRAIN_SENSOR_COUNT) {
+                return 0;
+        }
+        return sensors->sensor_state[first] == 1 ||
+                sensors->sensor_state[first + 1] == 1;
+}
+
+static int tc2_demo_active_sensor(
+        const train_sensor_snapshot_t *sensors, int sensor) {
+        int first = sensor & ~1;
+        if (!sensors || first < 0 ||
+            first + 1 >= TRAIN_SENSOR_COUNT) {
+                return -1;
+        }
+        if (sensors->sensor_state[first] == 1) return first;
+        if (sensors->sensor_state[first + 1] == 1) return first + 1;
+        return -1;
+}
+
+/*
+ * Accept the nearest newly-active detector at or ahead of the current cursor.
+ * A detector must first have been observed low during this leg before its
+ * high level is consumable.  This prevents the endpoint detector from the
+ * previous leg (or any other stale high level) from being consumed again and
+ * making a train appear to reverse immediately.  Looking ahead still permits
+ * recovery from one genuinely missed intermediate pulse without moving the
+ * UI backwards.
+ */
+static int tc2_demo_find_route_sensor(
+        const train_sensor_snapshot_t *sensors, int slot,
+        int *matched_cursor) {
+        const int *route = tc2_demo_leg_sensors(slot);
+        int count = tc2_demo_leg_sensor_count(slot);
+        int first_cursor;
+
+        if (!route || !matched_cursor) return -1;
+        first_cursor = tc2_demo_state.route_sensor_cursor[slot];
+        if (first_cursor < 0) first_cursor = 0;
+        for (int cursor = first_cursor; cursor < count; ++cursor) {
+                unsigned int bit = 1u << (unsigned int)cursor;
+                if (!tc2_demo_sensor_pair_active(
+                            sensors, route[cursor])) {
+                        tc2_demo_state.route_armed_mask[slot] |= bit;
+                }
+        }
+        for (int cursor = first_cursor; cursor < count; ++cursor) {
+                unsigned int bit = 1u << (unsigned int)cursor;
+                if ((tc2_demo_state.route_armed_mask[slot] & bit) != 0u &&
+                    tc2_demo_sensor_pair_active(sensors, route[cursor])) {
+                        *matched_cursor = cursor;
+                        return tc2_demo_active_sensor(
+                                sensors, route[cursor]);
+                }
+        }
+        return -1;
+}
+
+static int tc2_demo_initial_stop_complete(void) {
+        can_batch_status_t status;
+
+        if (tc2_demo_state.initial_stop_token == 0) return 1;
+        if (tc_can_server_tid < 0 ||
+            CanGetBatchStatus(
+                    tc_can_server_tid,
+                    tc2_demo_state.initial_stop_token,
+                    &status) < 0 ||
+            status.token != tc2_demo_state.initial_stop_token ||
+            status.state == CAN_BATCH_FAILED) {
+                return -1;
+        }
+        if (status.state == CAN_BATCH_PENDING) return 0;
+        tc2_demo_state.initial_stop_token = 0;
+        return 1;
+}
+
+static void tc2_demo_set_ui_speed(
+        int slot, int speed, uint32_t now_tick) {
+        (void)Tc2UiOverlaySetTrainSpeed(
+                &tc2_live_ui_state.overlay,
+                tc2_demo_trains[slot], speed,
+                tc2_demo_state.ui_plan_generation[slot],
+                now_tick);
+}
+
+/*
+ * Keep the fake demonstration visually continuous without inventing sensor
+ * evidence.  Each running segment starts at the last displayed/confirmed
+ * cell and may advance only to a point strictly before its next unconfirmed
+ * detector.  The real detector event below remains authoritative and rebases
+ * both the marker and the next visual segment.
+ */
+static void tc2_demo_begin_ui_segment(
+        int slot, uint32_t now_tick) {
+        const tc2_ui_train_overlay *shown;
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return;
+        shown = Tc2UiOverlayFindTrain(
+                &tc2_live_ui_state.overlay,
+                tc2_demo_trains[slot]);
+        if (!shown) return;
+        tc2_demo_state.ui_segment_started_tick[slot] = now_tick;
+        tc2_demo_state.ui_segment_progress[slot] = 0;
+        tc2_demo_state.ui_segment_anchor_row[slot] = shown->row;
+        tc2_demo_state.ui_segment_anchor_column[slot] = shown->column;
+        if (shown->sensor_index >= 0) {
+                tc2_demo_state.ui_segment_anchor_sensor[slot] =
+                        shown->sensor_index;
+        }
+}
+
+static uint32_t tc2_demo_ui_segment_ticks(int slot) {
+	int velocity = tc_velocity_for_speed(tc2_demo_leg_speed(slot));
+        uint32_t ticks;
+
+        if (velocity < 1) velocity = 1;
+        ticks = (uint32_t)((TC2_DEMO_UI_SEGMENT_DISTANCE_MM +
+                            velocity - 1) / velocity);
+        if (ticks < TC2_DEMO_POLL_TICKS * 4u) {
+                ticks = TC2_DEMO_POLL_TICKS * 4u;
+        }
+        return ticks;
+}
+
+static void tc2_demo_update_ui_prediction(
+        int slot, uint32_t now_tick) {
+        const int *route;
+        const tc2_ui_train_overlay *shown;
+        tc2_track_d_directed_sensor_cell next_cell;
+        tc2_dispatch_projection_waypoint first = {0};
+        tc2_dispatch_projection_waypoint second = {0};
+        uint32_t duration;
+        uint32_t elapsed;
+        unsigned int progress;
+        int cursor;
+        int count;
+        int row;
+        int column;
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT ||
+            tc2_demo_state.phase[slot] != TC2_DEMO_RUNNING) {
+                return;
+        }
+        route = tc2_demo_leg_sensors(slot);
+        cursor = tc2_demo_state.route_sensor_cursor[slot];
+        count = tc2_demo_leg_sensor_count(slot);
+        if (!route || cursor < 0 || cursor >= count ||
+            tc2_demo_state.ui_segment_anchor_row[slot] < 0 ||
+            tc2_demo_state.ui_segment_anchor_column[slot] < 0 ||
+            Tc2TrackDDirectedSensorCell(
+                    route[cursor], &next_cell) < 0) {
+                return;
+        }
+
+	duration = tc2_demo_ui_segment_ticks(slot);
+        elapsed = now_tick -
+                tc2_demo_state.ui_segment_started_tick[slot];
+        progress = elapsed >= duration ?
+                TC2_DEMO_UI_UNCONFIRMED_LIMIT :
+                (unsigned int)(((uint64_t)elapsed *
+                                TC2_DEMO_UI_PROGRESS_SCALE) /
+                               duration);
+        if (progress > TC2_DEMO_UI_UNCONFIRMED_LIMIT) {
+                progress = TC2_DEMO_UI_UNCONFIRMED_LIMIT;
+        }
+        if (progress <= tc2_demo_state.ui_segment_progress[slot]) {
+                return;
+        }
+
+        first.kind =
+                tc2_demo_state.ui_segment_anchor_sensor[slot] >= 0 ?
+                TC2_ROUTE_WAYPOINT_SENSOR : TC2_ROUTE_WAYPOINT_START;
+        first.sensor_index = (int16_t)
+                tc2_demo_state.ui_segment_anchor_sensor[slot];
+        first.destination_index = -1;
+        first.ui_row = (uint8_t)
+                tc2_demo_state.ui_segment_anchor_row[slot];
+        first.ui_column = (uint8_t)
+                tc2_demo_state.ui_segment_anchor_column[slot];
+        first.ui_width = 1;
+        second.kind = TC2_ROUTE_WAYPOINT_SENSOR;
+        second.sensor_index = (int16_t)route[cursor];
+        second.destination_index = -1;
+        second.ui_row = next_cell.row;
+        second.ui_column = next_cell.column;
+        second.ui_width = next_cell.width;
+        if (!Tc2LiveUiInterpolateTrackCell(
+                    &first, &second,
+                    (int64_t)progress,
+                    (int64_t)TC2_DEMO_UI_PROGRESS_SCALE,
+                    &row, &column)) {
+                return;
+        }
+        tc2_demo_state.ui_segment_progress[slot] = progress;
+        shown = Tc2UiOverlayFindTrain(
+                &tc2_live_ui_state.overlay,
+                tc2_demo_trains[slot]);
+        if (shown && shown->row == row && shown->column == column) {
+                return;
+        }
+        ++tc2_demo_state.ui_position_revision[slot];
+        if (tc2_demo_state.ui_position_revision[slot] == 0) {
+                ++tc2_demo_state.ui_position_revision[slot];
+        }
+        (void)Tc2UiOverlayUpdatePredictedCell(
+                &tc2_live_ui_state.overlay,
+                tc2_demo_trains[slot], row, column,
+                tc2_demo_state.ui_plan_generation[slot],
+                tc2_demo_state.ui_position_revision[slot],
+                now_tick);
+}
+
+static void tc2_demo_set_ui_at_sensor(
+        int slot, int sensor_index, uint32_t now_tick) {
+	tc2_track_d_directed_sensor_cell cell;
+
+        ++tc2_demo_state.ui_position_revision[slot];
+        ++tc2_demo_state.ui_sensor_sequence[slot];
+        (void)Tc2UiOverlayUpdateAtSensor(
+                &tc2_live_ui_state.overlay,
+                tc2_demo_trains[slot], sensor_index,
+                tc2_demo_state.ui_plan_generation[slot],
+                tc2_demo_state.ui_position_revision[slot],
+                tc2_demo_state.ui_sensor_sequence[slot],
+                TC2_UI_QUALITY_SENSOR_CONFIRMED, now_tick);
+	if (Tc2TrackDDirectedSensorCell(sensor_index, &cell) >= 0) {
+		tc2_demo_state.ui_segment_started_tick[slot] = now_tick;
+		tc2_demo_state.ui_segment_progress[slot] = 0;
+		tc2_demo_state.ui_segment_anchor_sensor[slot] = sensor_index;
+		tc2_demo_state.ui_segment_anchor_row[slot] = cell.row;
+		tc2_demo_state.ui_segment_anchor_column[slot] = cell.column;
+	}
+}
+
+static void tc2_demo_publish_status(
+        uint32_t now_tick, int running, int waiting,
+        int stopped, int reversing, int force) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+        size_t length;
+        int phase_changed = 0;
+        unsigned int elapsed_seconds =
+                (unsigned int)((now_tick - tc2_demo_state.started_tick) /
+                               100u);
+
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                if (tc2_demo_state.last_phase[slot] !=
+                    tc2_demo_state.phase[slot]) {
+                        phase_changed = 1;
+                        break;
+                }
+        }
+        if (!force &&
+            !phase_changed &&
+            running == tc2_demo_state.last_running &&
+            waiting == tc2_demo_state.last_waiting &&
+            stopped == tc2_demo_state.last_stopped &&
+            reversing == tc2_demo_state.last_reversing &&
+            (int)elapsed_seconds ==
+                    tc2_demo_state.last_elapsed_seconds) {
+                return;
+        }
+        tc2_demo_state.last_running = running;
+        tc2_demo_state.last_waiting = waiting;
+        tc2_demo_state.last_stopped = stopped;
+        tc2_demo_state.last_reversing = reversing;
+        tc2_demo_state.last_elapsed_seconds =
+                (int)elapsed_seconds;
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                tc2_demo_state.last_phase[slot] =
+                        tc2_demo_state.phase[slot];
+        }
+
+        tc2_ui_status[0] = 0;
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), 0,
+                "RETURNBACK speed=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                (unsigned int)profile->speed);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " elapsed=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                elapsed_seconds);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                "s RUNNING=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                (unsigned int)running);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " WAIT_TURNOUT=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                (unsigned int)waiting);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " STOPPED=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                (unsigned int)stopped);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " REVERSING=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                (unsigned int)reversing);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " actions=");
+        length = tc2_status_append_uint(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                tc2_demo_state.action_count);
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " T14=");
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                tc2_demo_phase_name(tc2_demo_state.phase[0]));
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " T15=");
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                tc2_demo_phase_name(tc2_demo_state.phase[1]));
+        length = tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                " T17=");
+        (void)tc2_status_append(
+                tc2_ui_status, sizeof(tc2_ui_status), length,
+                tc2_demo_phase_name(tc2_demo_state.phase[2]));
+        tc2_ui_status_dirty = 1;
+}
+
+static void tc2_demo_publish_phase_status(
+        uint32_t now_tick, int force) {
+        int running = 0;
+        int waiting = 0;
+        int stopped = 0;
+        int reversing = 0;
+
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                switch (tc2_demo_state.phase[slot]) {
+                case TC2_DEMO_WAIT_TURNOUT:
+                        ++waiting;
+                        break;
+                case TC2_DEMO_RUNNING:
+                case TC2_DEMO_ENDPOINT_TRIM_RUNNING:
+                        ++running;
+                        break;
+                case TC2_DEMO_REVERSING:
+                        ++reversing;
+                        break;
+                case TC2_DEMO_INITIAL_STOPPING:
+                case TC2_DEMO_STOPPED:
+                case TC2_DEMO_ENDPOINT_TRIM_STOPPED:
+                case TC2_DEMO_SENSOR_RECOVERY:
+                case TC2_DEMO_PAUSED:
+                        ++stopped;
+                        break;
+                default:
+                        break;
+                }
+        }
+        tc2_demo_publish_status(
+                now_tick, running, waiting, stopped, reversing, force);
+}
+
+static void tc2_demo_pause_train(int slot, uint32_t now_tick) {
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return;
+        if (tc_can_server_tid >= 0) {
+                (void)CanTrainSetSpeedPriority(
+                        tc_can_server_tid,
+                        tc2_demo_trains[slot], 0);
+        }
+        tc2_demo_state.phase[slot] = TC2_DEMO_PAUSED;
+        tc2_demo_state.phase_started_tick[slot] = now_tick;
+	tc2_demo_state.pending_batch_token[slot] = 0;
+	tc2_demo_state.resume_after_wait[slot] = 0;
+	tc2_demo_state.reverse_after_wait[slot] = 0;
+	tc2_demo_state.deferred_initial_prepare[slot] = 0;
+	tc2_demo_state.station_stop[slot] = 0;
+        tc2_demo_state.route_armed_mask[slot] = 0;
+        tc2_demo_set_ui_speed(slot, 0, now_tick);
+        ++tc2_demo_state.action_count;
+}
+
+/*
+ * A missed detector never authorizes a reverse.  Stop only the affected
+ * corridor, retain its forward route cursor, and perform at most a small
+ * number of same-direction restart attempts.  The old implementation stayed
+ * at speed zero while waiting for a detector in front of the train, which was
+ * an unrecoverable state by construction.
+ */
+static void tc2_demo_enter_sensor_recovery(
+        int slot, uint32_t now_tick) {
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return;
+        if (tc_can_server_tid >= 0) {
+                (void)CanTrainSetSpeedPriority(
+                        tc_can_server_tid,
+                        tc2_demo_trains[slot], 0);
+        }
+        tc2_demo_state.phase[slot] = TC2_DEMO_SENSOR_RECOVERY;
+	tc2_demo_state.phase_started_tick[slot] = now_tick;
+	tc2_demo_state.resume_after_wait[slot] = 0;
+	tc2_demo_state.reverse_after_wait[slot] = 0;
+	tc2_demo_state.station_stop[slot] = 0;
+        tc2_demo_set_ui_speed(slot, 0, now_tick);
+        ++tc2_demo_state.sensor_recovery_restarts[slot];
+        ++tc2_demo_state.action_count;
+}
+
+static void tc2_demo_pause_all(
+        uint32_t now_tick, const char *reason) {
+        if (tc_can_server_tid >= 0) {
+                (void)CanTrainEmergencyStopBatch(
+                        tc_can_server_tid, tc2_demo_trains,
+                        TC2_DEMO_TRAIN_COUNT);
+        }
+        tc2_demo_state.initializing = 0;
+        tc2_demo_state.initial_stop_token = 0;
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                tc2_demo_state.phase[slot] = TC2_DEMO_PAUSED;
+                tc2_demo_state.phase_started_tick[slot] = now_tick;
+		tc2_demo_state.pending_batch_token[slot] = 0;
+		tc2_demo_state.resume_after_wait[slot] = 0;
+		tc2_demo_state.reverse_after_wait[slot] = 0;
+		tc2_demo_state.deferred_initial_prepare[slot] = 0;
+		tc2_demo_state.station_stop[slot] = 0;
+                tc2_demo_state.route_armed_mask[slot] = 0;
+                tc2_demo_set_ui_speed(slot, 0, now_tick);
+        }
+        tc2_demo_publish_phase_status(now_tick, 1);
+        tc2_status_set(reason);
+}
+
+/*
+ * The dispatcher relay transports at most four turnout commands per IPC
+ * request.  A fixed demo leg may describe a longer logical route (T15's
+ * d3 -> C return currently has seven turnouts), so submit that route as
+ * consecutive, synchronously confirmed relay batches.  The train remains
+ * stopped throughout this helper and tc2_demo_prepare_leg starts the normal
+ * two-second mechanical settle interval only after every chunk succeeds.
+ */
+static int tc2_demo_set_leg_turnouts(
+        const int *switches, const char *directions, int count) {
+        int offset = 0;
+
+        if (count < 0 || count > TC2_DEMO_MAX_LEG_SWITCHES) return -1;
+        if (count == 0) return 0;
+        if (!switches || !directions) return -1;
+
+        while (offset < count) {
+                int chunk = count - offset;
+                if (chunk > TC2_DEMO_TURNOUT_BATCH_LIMIT) {
+                        chunk = TC2_DEMO_TURNOUT_BATCH_LIMIT;
+                }
+                if (Tc2DispatchDemoSwitchBatch(
+                            tc_dispatch_server_tid,
+                            switches + offset,
+                            directions + offset,
+                            chunk) < 0) {
+                        return -1;
+                }
+                offset += chunk;
+        }
+        return 0;
+}
+
+/*
+ * Turnouts are issued by the dispatcher, the sole CAN turnout authority.
+ * Fixed-profile dependencies serialize any shared throat before a train
+ * reaches this function.  Each accepted call therefore prepares one complete
+ * leg while its train remains stopped, without relying on ordinary dispatcher
+ * job state.
+ */
+static int tc2_demo_prepare_leg(
+        int slot, uint32_t now_tick,
+        const train_sensor_snapshot_t *sensors) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+        const int *switches;
+        const char *directions;
+        int count;
+        int raw_time;
+        uint32_t confirmed_tick;
+
+        if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT) return -1;
+        if (tc2_demo_state.outbound_leg[slot]) {
+                switches = profile->outbound_switches[slot];
+                directions = profile->outbound_directions[slot];
+                count = profile->outbound_switch_count[slot];
+        } else {
+                switches = profile->return_switches[slot];
+                directions = profile->return_directions[slot];
+                count = profile->return_switch_count[slot];
+        }
+        if (tc2_demo_set_leg_turnouts(
+                    switches, directions, count) < 0) {
+                return -1;
+        }
+        raw_time = Time();
+        confirmed_tick = raw_time < 0 ? now_tick : (uint32_t)raw_time;
+        tc2_demo_state.phase[slot] = TC2_DEMO_WAIT_TURNOUT;
+        tc2_demo_state.phase_started_tick[slot] = confirmed_tick;
+        tc2_demo_state.wait_until_tick[slot] =
+                confirmed_tick + TC2_DEMO_WAIT_TURNOUT_TICKS +
+                ((tc2_demo_state.outbound_leg[slot] &&
+                  tc2_demo_state.first_departure[slot]) ?
+                 profile->initial_launch_stagger_ticks[slot] : 0u);
+        tc2_demo_state.pending_batch_token[slot] = 0;
+        tc2_demo_state.route_sensor_cursor[slot] = 0;
+        tc2_demo_state.route_armed_mask[slot] = 0;
+        tc2_demo_state.sensor_recovery_restarts[slot] = 0;
+        {
+                const int *route = tc2_demo_leg_sensors(slot);
+                int sensor_count = tc2_demo_leg_sensor_count(slot);
+                for (int cursor = 0; cursor < sensor_count; ++cursor) {
+                        if (!tc2_demo_sensor_pair_active(
+                                    sensors, route[cursor])) {
+                                tc2_demo_state.route_armed_mask[slot] |=
+                                        1u << (unsigned int)cursor;
+                        }
+                }
+        }
+        tc2_demo_state.resume_after_wait[slot] = 0;
+        tc2_demo_state.station_stop[slot] = 0;
+        tc2_demo_state.action_count += (unsigned int)count;
+        return 0;
+}
+
+static uint32_t tc2_demo_endpoint_trim_ticks(int slot) {
+	const tc2_demo_profile *profile = tc2_demo_profile_config();
+	int velocity = tc_velocity_for_speed(TC2_DEMO_ENDPOINT_TRIM_SPEED);
+	int distance = 40;
+	if (slot >= 0 && slot < TC2_DEMO_TRAIN_COUNT) {
+		distance = tc2_demo_state.outbound_leg[slot] ?
+			profile->endpoint_trim_outbound_mm[slot] :
+			profile->endpoint_trim_return_mm[slot];
+	}
+	if (velocity < 1) velocity = 1;
+	return (uint32_t)((distance + velocity - 1) /
+	                  velocity);
+}
+
+static uint32_t tc2_demo_t17_release_clearance_ticks(void) {
+	const tc2_demo_profile *profile = tc2_demo_profile_config();
+	int velocity = tc_velocity_for_speed(profile->speed);
+	if (velocity < 1) velocity = 1;
+	return (uint32_t)((profile->third_train_release_clearance_mm +
+	                  velocity - 1) /
+	                  velocity);
+}
+
+/*
+ * Each scripted endpoint has a fixed, hardware-measured trim beyond its final
+ * detector.  First stop and settle the train, then perform one bounded
+ * low-speed trim.  This phase is terminal-only; intermediate detector and
+ * station handling never enters it.
+ */
+static int tc2_demo_begin_endpoint_trim(int slot, uint32_t now_tick) {
+	if (slot < 0 || slot >= TC2_DEMO_TRAIN_COUNT ||
+	    tc_can_server_tid < 0 ||
+	    CanTrainSetSpeedPriority(
+		    tc_can_server_tid, tc2_demo_trains[slot], 0) < 0) {
+		return -1;
+	}
+	tc2_demo_state.phase[slot] = TC2_DEMO_ENDPOINT_TRIM_STOPPED;
+	tc2_demo_state.phase_started_tick[slot] = now_tick;
+	tc2_demo_state.wait_until_tick[slot] =
+		now_tick + TC2_DEMO_ENDPOINT_BRAKE_SETTLE_TICKS;
+	tc2_demo_state.station_stop[slot] = 0;
+	tc2_demo_set_ui_speed(slot, 0, now_tick);
+	++tc2_demo_state.action_count;
+	return 0;
+}
+
+static int tc2_start_physical_demo(
+        uint32_t now_tick, int train_a, int train_c, int train_f,
+        int profile_id) {
+        tc2_dispatch_snapshot dispatch;
+        train_sensor_snapshot_t sensors;
+        can_health_t health;
+        int token;
+
+        if (tc_dispatch_server_tid < 0 ||
+            tc_sensor_server_tid < 0 ||
+            tc_can_server_tid < 0 ||
+            Tc2DispatchGetSnapshot(
+                    tc_dispatch_server_tid, &dispatch) < 0 ||
+            !dispatch.scheduler_healthy || dispatch.job_count != 0 ||
+            TrainSensorGetLatest(
+                    tc_sensor_server_tid, &sensors) < 0 ||
+            !sensors.sensor_server_registered || !sensors.courier_ready ||
+            CanGetHealth(tc_can_server_tid, &health) < 0 ||
+            !health.hw_ready) {
+                return -1;
+        }
+
+        if (profile_id < 0 || profile_id >= TC2_DEMO_PROFILE_COUNT ||
+            train_a < 1 || train_a > 255 ||
+            train_c < 1 || train_c > 255 ||
+            train_f < 1 || train_f > 255 ||
+            train_a == train_c || train_a == train_f ||
+            train_c == train_f) {
+                return -1;
+        }
+
+        tc2_demo_reset_state();
+        tc2_demo_state.profile_id = profile_id;
+        tc2_demo_trains[0] = train_a;
+        tc2_demo_trains[1] = train_c;
+        tc2_demo_trains[2] = train_f;
+        token = CanTrainEmergencyStopBatch(
+                tc_can_server_tid, tc2_demo_trains,
+                TC2_DEMO_TRAIN_COUNT);
+        if (token <= 0) return -1;
+
+        tc2_demo_state.active = 1;
+        tc2_demo_state.initializing = 1;
+        tc2_demo_state.started_tick = now_tick;
+        tc2_demo_state.next_poll_tick = now_tick;
+        tc2_demo_state.initial_stop_token = (unsigned int)token;
+        Tc2LiveUiInitialize(&tc2_live_ui_state, now_tick);
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                tc2_demo_state.phase[slot] =
+                        TC2_DEMO_INITIAL_STOPPING;
+                tc2_demo_state.phase_started_tick[slot] = now_tick;
+                if (Tc2UiOverlayUpsertAtStart(
+                            &tc2_live_ui_state.overlay,
+                            tc2_demo_trains[slot],
+                            tc2_demo_starts[slot],
+                            tc2_demo_profile_config()
+                                    ->ui_destinations[slot],
+                            tc2_demo_state.ui_plan_generation[slot],
+                            TC2_UI_QUALITY_ESTIMATED,
+                            now_tick) < 0) {
+                        tc2_demo_pause_all(
+                                now_tick,
+                                "RETURNBACK PAUSED: UI initialization failed");
+                        return -1;
+                }
+		{
+			const tc2_track_d_start_layout *start =
+				Tc2TrackDStartLayout((size_t)tc2_demo_starts[slot]);
+			if (start) {
+				tc2_demo_state.ui_segment_started_tick[slot] =
+					now_tick;
+				tc2_demo_state.ui_segment_progress[slot] = 0;
+				tc2_demo_state.ui_segment_anchor_sensor[slot] = -1;
+				tc2_demo_state.ui_segment_anchor_row[slot] =
+					start->row;
+				tc2_demo_state.ui_segment_anchor_column[slot] =
+					start->column;
+			}
+		}
+        }
+        tc2_ui_active = 1;
+        tc2_ui_live = 1;
+        tc2_ui_shutdown_requested = 0;
+        tc2_ui_shutdown_frame_queued = 0;
+        tc2_ui_next_render_tick = 0;
+        tc2_demo_publish_phase_status(now_tick, 1);
+        return 0;
+}
+
+static void tc2_step_physical_demo(uint32_t now_tick) {
+        const tc2_demo_profile *profile = tc2_demo_profile_config();
+        train_sensor_snapshot_t sensors;
+
+        if (!tc2_demo_state.active ||
+            !tc2_tick_due(
+                    now_tick, tc2_demo_state.next_poll_tick)) {
+                return;
+        }
+        tc2_demo_state.next_poll_tick =
+                now_tick + TC2_DEMO_POLL_TICKS;
+        if (tc_sensor_server_tid < 0 ||
+            TrainSensorGetLatest(
+                    tc_sensor_server_tid, &sensors) < 0 ||
+            !sensors.sensor_server_registered || !sensors.courier_ready) {
+                ++tc2_demo_state.sensor_failure_count;
+                if (tc2_demo_state.sensor_failure_count >=
+                    TC2_DEMO_SENSOR_FAILURE_LIMIT) {
+                        tc2_demo_pause_all(
+                                now_tick,
+                                "RETURNBACK PAUSED: sustained sensor service failure");
+                }
+                return;
+        }
+        tc2_demo_state.sensor_failure_count = 0;
+        (void)Tc2UiOverlayExpireSensorFlashes(
+                &tc2_live_ui_state.overlay, now_tick);
+
+        if (tc2_demo_state.initializing) {
+                int complete = tc2_demo_initial_stop_complete();
+                if (complete < 0) {
+                        tc2_demo_pause_all(
+                                now_tick,
+                                "RETURNBACK PAUSED: initial stop failed");
+                        return;
+                }
+                if (complete == 0 ||
+                    !tc2_tick_due(
+                            now_tick,
+                            tc2_demo_state.started_tick +
+                                    TC2_DEMO_STOP_DWELL_TICKS)) {
+                        tc2_demo_publish_phase_status(now_tick, 0);
+                        return;
+                }
+                tc2_demo_state.initializing = 0;
+		for (int slot = 0;
+		     slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+			/*
+			 * A profile may defer one fixed corridor until its declared
+			 * predecessor has completed, or use the original T17 return-leg
+			 * clearance gate.  Trains without either gate prepare immediately.
+			 */
+			if ((slot == 2 && profile->defer_third_train) ||
+			    profile->initial_completion_dependency[slot] >= 0) {
+				tc2_demo_state.phase[slot] =
+					TC2_DEMO_WAIT_TURNOUT;
+				tc2_demo_state.phase_started_tick[slot] =
+					now_tick;
+				tc2_demo_state.deferred_initial_prepare[slot] = 1;
+				continue;
+			}
+			if (tc2_demo_prepare_leg(
+				    slot, now_tick, &sensors) < 0) {
+                                tc2_demo_pause_train(slot, now_tick);
+                        }
+                }
+                tc2_demo_publish_phase_status(now_tick, 1);
+                return;
+        }
+
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+		uint32_t previous_account_tick =
+			tc2_demo_state.motion_account_tick[slot];
+		if (previous_account_tick != 0u &&
+		    !tc2_demo_state.outbound_leg[slot] &&
+		    tc2_demo_state.phase[slot] == TC2_DEMO_RUNNING) {
+			uint32_t elapsed = now_tick - previous_account_tick;
+			uint32_t required =
+				tc2_demo_t17_release_clearance_ticks();
+			uint32_t accumulated =
+				tc2_demo_state.return_running_ticks[slot];
+			if (accumulated < required) {
+				uint32_t remaining = required - accumulated;
+				tc2_demo_state.return_running_ticks[slot] +=
+					elapsed < remaining ? elapsed : remaining;
+			}
+		}
+		tc2_demo_state.motion_account_tick[slot] = now_tick;
+                switch (tc2_demo_state.phase[slot]) {
+	case TC2_DEMO_WAIT_TURNOUT:
+			if (tc2_demo_state.deferred_initial_prepare[slot]) {
+				int dependency =
+					profile->initial_completion_dependency[slot];
+				uint32_t clearance_ticks =
+					tc2_demo_t17_release_clearance_ticks();
+				/*
+				 * Count only commanded RUNNING time on the return legs.  Stops,
+				 * turnout waits and reversing time do not consume clearance.
+				 * Endpoint confirmation is also sufficient for a short route.
+				 */
+				if (dependency >= 0 &&
+				    dependency < TC2_DEMO_TRAIN_COUNT) {
+					int release_cursor =
+						profile->initial_dependency_release_cursor[slot];
+					int dependency_clear =
+						tc2_demo_state.completed_cycles[dependency] ||
+						(release_cursor >= 0 &&
+						 tc2_demo_state.route_sensor_cursor[dependency] >=
+							release_cursor);
+					if (!dependency_clear) {
+						break;
+					}
+				} else if (!tc2_demo_state.return_leg_started[0] ||
+				    !tc2_demo_state.return_leg_started[1] ||
+				    (tc2_demo_state.return_running_ticks[0] <
+					     clearance_ticks &&
+				     tc2_demo_state.route_sensor_cursor[0] <
+					     profile->return_count[0]) ||
+				    (tc2_demo_state.return_running_ticks[1] <
+					     clearance_ticks &&
+				     tc2_demo_state.route_sensor_cursor[1] <
+					     profile->return_count[1])) {
+					break;
+				}
+				tc2_demo_state.deferred_initial_prepare[slot] = 0;
+				if (tc2_demo_prepare_leg(
+					    slot, now_tick, &sensors) < 0) {
+					tc2_demo_pause_train(slot, now_tick);
+				}
+				break;
+			}
+			if (!tc2_tick_due(
+                                    now_tick,
+                                    tc2_demo_state
+						.wait_until_tick[slot])) {
+				break;
+			}
+			/*
+			 * At a turnaround, prepare and settle the complete return
+			 * turnout set while the train is still stopped.  Only after
+			 * that two-second settle window may the physical direction be
+			 * reversed.  This prevents a train from reversing on a turnout
+			 * that has just moved underneath it.
+			 */
+			if (tc2_demo_state.reverse_after_wait[slot]) {
+				if (CanTrainReversePriority(
+						    tc_can_server_tid,
+						    tc2_demo_trains[slot]) < 0) {
+					tc2_demo_pause_train(slot, now_tick);
+					break;
+				}
+				tc2_demo_state.reverse_after_wait[slot] = 0;
+				tc2_demo_state.phase[slot] =
+					TC2_DEMO_REVERSING;
+				tc2_demo_state.phase_started_tick[slot] = now_tick;
+				++tc2_demo_state.action_count;
+				break;
+			}
+			{
+				int leg_speed = tc2_demo_leg_speed(slot);
+				if (CanTrainSetSpeedPriority(
+					    tc_can_server_tid,
+					    tc2_demo_trains[slot],
+					    leg_speed) < 0) {
+                                tc2_demo_pause_train(slot, now_tick);
+                                break;
+				}
+                        tc2_demo_state.phase[slot] = TC2_DEMO_RUNNING;
+                        tc2_demo_state.phase_started_tick[slot] = now_tick;
+                        if (!tc2_demo_state.resume_after_wait[slot]) {
+                                tc2_demo_state.route_sensor_cursor[slot] = 0;
+                        }
+			if (!tc2_demo_state.outbound_leg[slot]) {
+				tc2_demo_state.return_leg_started[slot] = 1;
+			}
+                        tc2_demo_state.resume_after_wait[slot] = 0;
+                        tc2_demo_set_ui_speed(
+                                slot, leg_speed, now_tick);
+			tc2_demo_begin_ui_segment(slot, now_tick);
+                        ++tc2_demo_state.action_count;
+			}
+                        break;
+
+                case TC2_DEMO_RUNNING: {
+                        int matched_cursor = -1;
+                        int sensor = tc2_demo_find_route_sensor(
+                                &sensors, slot, &matched_cursor);
+                        int count = tc2_demo_leg_sensor_count(slot);
+                        if (sensor >= 0 && matched_cursor >= 0) {
+                                tc2_demo_set_ui_at_sensor(
+                                        slot, sensor, now_tick);
+                                tc2_demo_state.route_sensor_cursor[slot] =
+                                        matched_cursor + 1;
+                                tc2_demo_state.phase_started_tick[slot] =
+                                        now_tick;
+                                tc2_demo_state
+                                        .sensor_recovery_restarts[slot] = 0;
+                                if (matched_cursor + 2 == count) {
+                                        int approach_speed =
+                                                tc2_demo_state.outbound_leg[slot] ?
+                                                profile->outbound_final_approach_speed
+                                                        [slot] :
+                                                profile->return_final_approach_speed
+                                                        [slot];
+                                        if (approach_speed > 0) {
+                                                if (CanTrainSetSpeedPriority(
+                                                            tc_can_server_tid,
+                                                            tc2_demo_trains[slot],
+                                                            approach_speed) < 0) {
+                                                        tc2_demo_pause_train(
+                                                                slot, now_tick);
+                                                        break;
+                                                }
+                                                tc2_demo_set_ui_speed(
+                                                        slot, approach_speed,
+                                                        now_tick);
+                                                ++tc2_demo_state.action_count;
+                                        }
+                                }
+                                if (matched_cursor + 1 >= count) {
+                                        if (tc2_demo_begin_endpoint_trim(
+                                                    slot, now_tick) < 0) {
+                                                tc2_demo_pause_train(
+                                                        slot, now_tick);
+                                        }
+				} else if (tc2_demo_is_return_correction_stop(
+						   slot, matched_cursor)) {
+					if (CanTrainSetSpeedPriority(
+						    tc_can_server_tid,
+						    tc2_demo_trains[slot], 0) < 0) {
+						tc2_demo_pause_train(slot, now_tick);
+						break;
+					}
+					tc2_demo_state.phase[slot] =
+						TC2_DEMO_STOPPED;
+					tc2_demo_state.phase_started_tick[slot] =
+						now_tick;
+					tc2_demo_state.station_stop[slot] = 1;
+					tc2_demo_set_ui_speed(slot, 0, now_tick);
+					++tc2_demo_state.action_count;
+                                } else if (matched_cursor ==
+                                           tc2_demo_leg_station_cursor(
+                                                   slot)) {
+                                        if (CanTrainSetSpeedPriority(
+                                                    tc_can_server_tid,
+                                                    tc2_demo_trains[slot],
+                                                    0) < 0) {
+                                                tc2_demo_pause_train(
+                                                        slot, now_tick);
+                                                break;
+                                        }
+                                        tc2_demo_state.phase[slot] =
+                                                TC2_DEMO_STOPPED;
+                                        tc2_demo_state
+                                                .phase_started_tick[slot] =
+                                                        now_tick;
+                                        tc2_demo_state.station_stop[slot] = 1;
+                                        tc2_demo_set_ui_speed(
+                                                slot, 0, now_tick);
+                                        ++tc2_demo_state.action_count;
+                                }
+			} else {
+				tc2_demo_update_ui_prediction(slot, now_tick);
+				if (tc2_tick_due(
+                                           now_tick,
+                                           tc2_demo_state
+                                                   .phase_started_tick[slot] +
+                                                   TC2_DEMO_SENSOR_TIMEOUT_TICKS)) {
+                                if (tc2_demo_state
+                                            .sensor_recovery_restarts[slot] >=
+                                    TC2_DEMO_MAX_SENSOR_RECOVERY_RESTARTS) {
+                                        tc2_demo_pause_train(slot, now_tick);
+                                } else {
+                                        /* Stop only the affected corridor. */
+                                        tc2_demo_enter_sensor_recovery(
+                                                slot, now_tick);
+                                }
+				}
+                        }
+                        break;
+                }
+
+                case TC2_DEMO_SENSOR_RECOVERY: {
+                        int matched_cursor = -1;
+                        int sensor = tc2_demo_find_route_sensor(
+                                &sensors, slot, &matched_cursor);
+                        int count = tc2_demo_leg_sensor_count(slot);
+
+                        if (sensor < 0 || matched_cursor < 0) {
+                                if (!tc2_tick_due(
+                                            now_tick,
+                                            tc2_demo_state
+                                                    .phase_started_tick[slot] +
+                                                    TC2_DEMO_SENSOR_RECOVERY_DWELL_TICKS)) {
+                                        break;
+                                }
+				{
+					int leg_speed = tc2_demo_leg_speed(slot);
+					if (CanTrainSetSpeedPriority(
+						    tc_can_server_tid,
+						    tc2_demo_trains[slot],
+						    leg_speed) < 0) {
+                                        tc2_demo_pause_train(slot, now_tick);
+                                        break;
+					}
+                                tc2_demo_state.phase[slot] =
+                                        TC2_DEMO_RUNNING;
+                                tc2_demo_state.phase_started_tick[slot] =
+                                        now_tick;
+                                tc2_demo_set_ui_speed(
+						slot, leg_speed, now_tick);
+                                ++tc2_demo_state.action_count;
+				}
+                                break;
+                        }
+                        tc2_demo_set_ui_at_sensor(
+                                slot, sensor, now_tick);
+                        tc2_demo_state.route_sensor_cursor[slot] =
+                                matched_cursor + 1;
+                        tc2_demo_state.phase_started_tick[slot] = now_tick;
+                        tc2_demo_state.sensor_recovery_restarts[slot] = 0;
+                        if (matched_cursor + 1 >= count) {
+                                if (tc2_demo_begin_endpoint_trim(
+                                            slot, now_tick) < 0) {
+                                        tc2_demo_pause_train(slot, now_tick);
+                                }
+			} else if (tc2_demo_is_return_correction_stop(
+					   slot, matched_cursor)) {
+				tc2_demo_state.phase[slot] = TC2_DEMO_STOPPED;
+				tc2_demo_state.phase_started_tick[slot] = now_tick;
+				tc2_demo_state.station_stop[slot] = 1;
+				tc2_demo_set_ui_speed(slot, 0, now_tick);
+                        } else if (matched_cursor ==
+                                  tc2_demo_leg_station_cursor(slot)) {
+                                tc2_demo_state.phase[slot] =
+                                        TC2_DEMO_STOPPED;
+                                tc2_demo_state.station_stop[slot] = 1;
+                        } else {
+                                tc2_demo_state.phase[slot] =
+                                        TC2_DEMO_WAIT_TURNOUT;
+                                tc2_demo_state.wait_until_tick[slot] =
+                                        now_tick +
+                                        TC2_DEMO_WAIT_TURNOUT_TICKS;
+                                tc2_demo_state.resume_after_wait[slot] = 1;
+                        }
+                        break;
+                }
+
+		case TC2_DEMO_ENDPOINT_TRIM_STOPPED:
+			if (!tc2_tick_due(
+				    now_tick,
+				    tc2_demo_state.wait_until_tick[slot])) {
+				break;
+			}
+			/*
+			 * A zero endpoint trim means the final detector is the scripted
+			 * stopping boundary.  Do not emit even a one-tick correction-speed
+			 * pulse: on the physical layout that pulse is enough to carry T14
+			 * beyond d4 and toward the turnout shared with T15.
+			 */
+			if (tc2_demo_endpoint_trim_ticks(slot) == 0u) {
+				tc2_demo_state.phase[slot] = TC2_DEMO_STOPPED;
+				tc2_demo_state.phase_started_tick[slot] = now_tick;
+				tc2_demo_state.station_stop[slot] = 0;
+				if (tc2_demo_state.outbound_leg[slot]) {
+					tc2_demo_state.first_departure[slot] = 0;
+				}
+				tc2_demo_set_ui_speed(slot, 0, now_tick);
+				break;
+			}
+			if (CanTrainSetSpeedPriority(
+				    tc_can_server_tid,
+				    tc2_demo_trains[slot],
+				    TC2_DEMO_ENDPOINT_TRIM_SPEED) < 0) {
+				tc2_demo_pause_train(slot, now_tick);
+				break;
+			}
+			tc2_demo_state.phase[slot] =
+				TC2_DEMO_ENDPOINT_TRIM_RUNNING;
+				tc2_demo_state.phase_started_tick[slot] = now_tick;
+				tc2_demo_state.wait_until_tick[slot] =
+					now_tick + tc2_demo_endpoint_trim_ticks(slot);
+			tc2_demo_set_ui_speed(
+				slot, TC2_DEMO_ENDPOINT_TRIM_SPEED, now_tick);
+			++tc2_demo_state.action_count;
+			break;
+
+		case TC2_DEMO_ENDPOINT_TRIM_RUNNING:
+			if (!tc2_tick_due(
+				    now_tick,
+				    tc2_demo_state.wait_until_tick[slot])) {
+				break;
+			}
+			if (CanTrainSetSpeedPriority(
+				    tc_can_server_tid,
+				    tc2_demo_trains[slot], 0) < 0) {
+				tc2_demo_pause_train(slot, now_tick);
+				break;
+			}
+			tc2_demo_state.phase[slot] = TC2_DEMO_STOPPED;
+			tc2_demo_state.phase_started_tick[slot] = now_tick;
+			tc2_demo_state.station_stop[slot] = 0;
+			if (tc2_demo_state.outbound_leg[slot]) {
+				tc2_demo_state.first_departure[slot] = 0;
+			}
+			tc2_demo_set_ui_speed(slot, 0, now_tick);
+			++tc2_demo_state.action_count;
+			break;
+
+                case TC2_DEMO_STOPPED:
+                        if (!tc2_tick_due(
+                                    now_tick,
+                                    tc2_demo_state
+                                            .phase_started_tick[slot] +
+                                            (tc2_demo_state
+                                                     .station_stop[slot] ?
+                                             TC2_DEMO_STOP_DWELL_TICKS :
+                                             profile->endpoint_dwell_ticks
+                                                     [slot]))) {
+                                break;
+                        }
+                        if (tc2_demo_state.station_stop[slot]) {
+                                /*
+                                 * This is a station stop, not a turnaround:
+                                 * retain the forward sensor cursor and wait
+                                 * for the already prepared next turnout set
+                                 * to remain stable before continuing.
+                                 */
+                                tc2_demo_state.station_stop[slot] = 0;
+                                tc2_demo_state.phase[slot] =
+                                        TC2_DEMO_WAIT_TURNOUT;
+                                tc2_demo_state.phase_started_tick[slot] =
+                                        now_tick;
+                                tc2_demo_state.wait_until_tick[slot] =
+                                        now_tick +
+                                        TC2_DEMO_WAIT_TURNOUT_TICKS;
+                                tc2_demo_state.resume_after_wait[slot] = 1;
+                                break;
+                        }
+                        /*
+                         * The fixed demonstration is exactly one outbound
+                         * leg and one return leg.  Reaching the end of the
+                         * return leg is terminal: leave the train stopped
+                         * and keep STOPPED visible instead of starting a
+                         * third leg.
+                         */
+                        if (!tc2_demo_state.outbound_leg[slot]) {
+				/*
+				 * Make the terminal stop explicit even when the endpoint
+				 * trim was zero or its earlier stop acknowledgement was
+				 * delayed.  This is especially important for T15 in the
+				 * d4/d3/d1 profile: a completed script must never leave a
+				 * stale non-zero locomotive command behind.
+				 */
+				if (!tc2_demo_state.completed_cycles[slot]) {
+					if (CanTrainSetSpeedPriority(
+						    tc_can_server_tid,
+						    tc2_demo_trains[slot], 0) < 0) {
+						tc2_demo_pause_train(slot, now_tick);
+						break;
+					}
+					tc2_demo_set_ui_speed(slot, 0, now_tick);
+					++tc2_demo_state.action_count;
+				}
+                                tc2_demo_state.completed_cycles[slot] = 1;
+                                break;
+                        }
+			{
+				unsigned int completion_mask =
+					profile->return_prepare_completion_mask[slot];
+				int dependency =
+					profile->return_prepare_dependency[slot];
+				int completions_ready = 1;
+
+				for (int peer = 0;
+				     peer < TC2_DEMO_TRAIN_COUNT; ++peer) {
+					if ((completion_mask &
+					     (1u << (unsigned int)peer)) != 0u) {
+						int peer_stopped_at_return_endpoint =
+							!tc2_demo_state.outbound_leg[peer] &&
+							tc2_demo_state.phase[peer] ==
+								TC2_DEMO_STOPPED &&
+							!tc2_demo_state.station_stop[peer] &&
+							tc2_demo_state.route_sensor_cursor[peer] >=
+								profile->return_count[peer];
+
+						/*
+						 * The final return detector plus speed zero is
+						 * already the physical clearance proof needed by
+						 * the fixed choreography.  Do not make T15 wait
+						 * forever for a later bookkeeping tick to set
+						 * completed_cycles.
+						 */
+						if (!tc2_demo_state.completed_cycles[peer] &&
+						    !peer_stopped_at_return_endpoint) {
+							completions_ready = 0;
+							break;
+						}
+					}
+				}
+				if (!completions_ready) {
+					tc2_demo_state
+						.return_prepare_release_tick[slot] = 0;
+					break;
+				}
+				if (dependency >= 0 &&
+				    dependency < TC2_DEMO_TRAIN_COUNT) {
+					int release_cursor =
+						profile->return_prepare_release_cursor[slot];
+					int wait_for_return =
+						profile->return_prepare_wait_for_return[slot];
+					int wait_for_endpoint =
+						profile->return_prepare_wait_for_endpoint[slot];
+					int dependency_clear;
+
+					if (wait_for_endpoint) {
+						dependency_clear =
+							tc2_demo_state.outbound_leg[dependency] &&
+							tc2_demo_state.phase[dependency] ==
+								TC2_DEMO_STOPPED &&
+							!tc2_demo_state.station_stop[dependency] &&
+							release_cursor >= 0 &&
+							tc2_demo_state
+								.route_sensor_cursor[dependency] >=
+								release_cursor;
+					} else if (wait_for_return) {
+						dependency_clear =
+							tc2_demo_state.completed_cycles[dependency] ||
+							(!tc2_demo_state.outbound_leg[dependency] &&
+							 release_cursor >= 0 &&
+							 tc2_demo_state
+								 .route_sensor_cursor[dependency] >=
+								release_cursor);
+					} else {
+						dependency_clear =
+							tc2_demo_state.completed_cycles[dependency] ||
+							!tc2_demo_state.outbound_leg[dependency] ||
+							(release_cursor >= 0 &&
+							 tc2_demo_state
+								 .route_sensor_cursor[dependency] >=
+								release_cursor);
+					}
+
+					if (!dependency_clear) {
+						tc2_demo_state
+							.return_prepare_release_tick[slot] = 0;
+						break;
+					}
+					/*
+					 * A detector confirms only the head of the dependency
+					 * train.  Keep this turnout unchanged for another two
+					 * seconds so its tail clears before preparing the return
+					 * route that may command the same physical switch.
+					 */
+					if (tc2_demo_state
+						    .return_prepare_release_tick[slot] == 0u) {
+						tc2_demo_state
+							.return_prepare_release_tick[slot] =
+								now_tick;
+						break;
+					}
+					if (!tc2_tick_due(
+						    now_tick,
+						    tc2_demo_state
+							    .return_prepare_release_tick[slot] +
+							    TC2_DEMO_WAIT_TURNOUT_TICKS)) {
+						break;
+					}
+					tc2_demo_state
+						.return_prepare_release_tick[slot] = 0;
+				}
+			}
+			/*
+			 * Select the return leg before issuing reverse so its complete
+			 * turnout batch is confirmed and mechanically settled first.
+			 */
+			tc2_demo_state.outbound_leg[slot] = 0;
+			if (tc2_demo_prepare_leg(
+					    slot, now_tick, &sensors) < 0) {
+				tc2_demo_state.outbound_leg[slot] = 1;
+				tc2_demo_pause_train(slot, now_tick);
+				break;
+			}
+			tc2_demo_state.reverse_after_wait[slot] = 1;
+			break;
+
+                case TC2_DEMO_REVERSING:
+                        if (!tc2_tick_due(
+                                    now_tick,
+                                    tc2_demo_state
+                                            .phase_started_tick[slot] +
+                                            TC2_DEMO_REVERSE_SETTLE_TICKS)) {
+                                break;
+                        }
+			/*
+			 * Return turnouts were prepared before reverse.  Do not issue
+			 * another switch batch here; after reverse itself has settled,
+			 * the normal WAIT_TURNOUT path may start the train.
+			 */
+			tc2_demo_state.phase[slot] = TC2_DEMO_WAIT_TURNOUT;
+			tc2_demo_state.phase_started_tick[slot] = now_tick;
+			tc2_demo_state.wait_until_tick[slot] = now_tick;
+			break;
+
+                case TC2_DEMO_INITIAL_STOPPING:
+                case TC2_DEMO_PAUSED:
+                case TC2_DEMO_IDLE:
+                default:
+                        break;
+                }
+        }
+        tc2_demo_publish_phase_status(now_tick, 0);
+}
+
+static int tc2_stop_physical_demo(void) {
+        int token;
+        int stopped_trains[TC2_DEMO_TRAIN_COUNT];
+        int raw_time = Time();
+        uint32_t now_tick = raw_time < 0 ? 0u : (uint32_t)raw_time;
+
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                stopped_trains[slot] = tc2_demo_trains[slot];
+        }
+        if (tc_can_server_tid < 0) {
+                tc2_status_set(
+                        "RETURNBACK STOP failed: CAN unavailable; script and UI preserved");
+                return 0;
+        }
+        token = CanTrainEmergencyStopBatch(
+                tc_can_server_tid, stopped_trains,
+                TC2_DEMO_TRAIN_COUNT);
+        if (token <= 0) {
+                tc2_status_set(
+                        "RETURNBACK STOP failed: stop batch rejected; script and UI preserved");
+                return 0;
+        }
+
+        /*
+         * A successful stop submission terminates the scripted session.  Do
+         * not leave its synthetic train records behind: uion must reopen a
+         * clean live overlay rather than resurrecting the three returnback
+         * trains from their last displayed positions.
+         */
+        tc2_demo_reset_state();
+        for (int slot = 0; slot < TC2_DEMO_TRAIN_COUNT; ++slot) {
+                tc2_demo_trains[slot] = 0;
+        }
+        Tc2LiveUiInitialize(&tc2_live_ui_state, now_tick);
+        tc2_ui_active = 0;
+        tc2_ui_live = 1;
+        tc2_ui_shutdown_requested = 0;
+        tc2_ui_shutdown_frame_queued = 0;
+        tc2_ui_next_render_tick = 0;
+        tc2_status_set(
+                "RETURNBACK STOP accepted: fixed routes and live UI cleared");
+        return TC2_DEMO_TRAIN_COUNT;
 }
 
 /*
@@ -1007,7 +2805,17 @@ static void print_help(int terminal_tid) {
         tc_puts(terminal_tid,
                 "  uion / uioff                enable / cleanly stop the dynamic Track D UI\r\n");
         tc_puts(terminal_tid,
-                "  Offline commands never send CAN, move a train, or change a physical switch.\r\n\r\n");
+                "  returnback <intersection/destination> <intersection/destination> <intersection/destination>\r\n");
+        tc_puts(terminal_tid,
+                "                               FAKE fixed-script demo for T14@A, T15@C, T17@F\r\n");
+        tc_puts(terminal_tid,
+                "                               UI shows RUNNING/WAIT_TURNOUT/STOPPED/REVERSING; this is not live route planning\r\n");
+        tc_puts(terminal_tid,
+                "                               FAKE means pre-scripted, not simulated: the three physical trains still move by CAN\r\n");
+        tc_puts(terminal_tid,
+                "  returnbackstop               emergency-stop all three scripted trains\r\n");
+        tc_puts(terminal_tid,
+                "  sim* offline commands never send CAN, move a train, or change a physical switch.\r\n\r\n");
         tc_puts(terminal_tid, "  dispatch <train 14|15|17|18> <A-F|CURRENT> <speed 1..120> <d1-d8>\r\n");
         tc_puts(terminal_tid, "                               stage one managed trip\r\n");
         tc_puts(terminal_tid, "  reroute <train 14|15|17|18> <speed> <d1-d8>\r\n");
@@ -1029,7 +2837,7 @@ static void print_help(int terminal_tid) {
         tc_puts(terminal_tid, "  cal                          print the shared TC2 motion model\r\n");
         tc_puts(terminal_tid, "  help                         show this help\r\n");
         tc_puts(terminal_tid,
-                "  tr/sw/route/stop/demo/reserve/release are disabled in TC2; all motion and protection use dispatch\r\n");
+                "  tr/sw/route/stop/reserve/release are disabled in TC2; all physical motion uses dispatch\r\n");
         tc_puts(terminal_tid, "  q                            quit command client\r\n");
         return;
 #else
@@ -1041,7 +2849,6 @@ static void print_help(int terminal_tid) {
         tc_puts(terminal_tid, "  obs <target> <speed> <ticks> compare predicted vs observed timing\r\n");
         tc_puts(terminal_tid, "  route <target>               set switches for a target, e.g. route C8\r\n");
         tc_puts(terminal_tid, "  stop <train> <target> <spd>  run then stop at target, e.g. stop 14 C8 30\r\n");
-        tc_puts(terminal_tid, "  demo                         run default stop demo: train 14 to C8 at speed 30\r\n");
         tc_puts(terminal_tid, "  tr <train> <speed>           direct speed command, 0..120\r\n");
         tc_puts(terminal_tid, "  sw <switch> <S|C>            direct switch command\r\n");
         tc_puts(terminal_tid, "  status                       print latest train-control state\r\n");
@@ -1757,7 +3564,8 @@ static void print_dispatch_wait_reason(
                 return;
         }
         if (job->state == TC2_JOB_STOPPED) {
-                tc_puts(terminal_tid, "operator removal required");
+                tc_puts(terminal_tid,
+                        "stopped/static; reroute or remove is available");
                 return;
         }
         tc_puts(terminal_tid, "-");
@@ -2817,6 +4625,15 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
         if (tc2_boot_diagnostic_line(p)) {
                 return;
         }
+        if (tc2_demo_state.active &&
+            !command_no_args(p, "returnbackstop") &&
+            !command_no_args(p, "help")) {
+                tc2_status_set(
+                        "returnback active; use returnbackstop before another command");
+                tc_puts(terminal_tid,
+                        "\r\nreturnback active: fixed script owns its three trains; use returnbackstop first\r\n");
+                return;
+        }
         if (tc2_handle_offline_command(p, 1, terminal_tid)) {
                 return;
         }
@@ -2895,11 +4712,12 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                 }
                 if (stage_status < 0) {
                         tc2_status_set(
-                                "reroute rejected; train must be managed, localized, and not pending removal");
+                                "reroute rejected; train is absent, unsupported, or pending physical removal");
                         tc_puts(terminal_tid,
-                                "\r\nreroute rejected: train must be managed, localized, and not pending removal\r\n");
+                                "\r\nreroute rejected: train is absent, unsupported, or pending physical removal\r\n");
                         return;
                 }
+                tc2_demo_state.active = 0;
                 tc2_status_set(
                         "reroute staged; enter go to stop safely and replan from CURRENT");
                 tc_puts(terminal_tid,
@@ -3005,6 +4823,7 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                                 "\r\ndispatch rejected: require train 14|15|17|18, A-F|CURRENT, speed 1..120, d1-d8, healthy scheduler, and available placement\r\n");
                         return;
                 }
+                tc2_demo_state.active = 0;
                 tc2_status_set(
                         "dispatch staged; enter go to start the train");
                 tc_puts(terminal_tid, "\r\ndispatch staged: train=");
@@ -3055,7 +4874,7 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                 return;
         }
 
-        if (command_token(p, "cancel")) {
+                if (command_token(p, "cancel")) {
                 p += 6;
                 if (parse_uint(&p, &a) < 0 || !no_more_args(p) ||
                     a < 1 || a > 255 ||
@@ -3065,6 +4884,7 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                         tc_puts(terminal_tid, "\r\ncancel failed\r\n");
                         return;
                 }
+                tc2_demo_state.active = 0;
                 tc2_status_set(
                         "cancel accepted; wait for stop, then remove");
                 tc_puts(terminal_tid, "\r\ncancel ok train=");
@@ -3074,7 +4894,7 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                 return;
         }
 
-        if (command_token(p, "remove")) {
+                if (command_token(p, "remove")) {
                 p += 6;
                 if (parse_uint(&p, &a) < 0 || !no_more_args(p) ||
                     a < 1 || a > 255 ||
@@ -3084,6 +4904,7 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
                         tc_puts(terminal_tid, "\r\nremove failed\r\n");
                         return;
                 }
+                tc2_demo_state.active = 0;
                 tc2_status_set(
                         "remove accepted; train may be dispatched again");
                 tc_puts(terminal_tid, "\r\nremove ok train=");
@@ -3204,11 +5025,71 @@ static void run_command(int terminal_tid, int can_tid, char *line) {
         }
 #endif
 
-        if (command_no_args(p, "demo")) {
+        if (command_no_args(p, "returnbackstop")) {
 #ifdef MODE_TC2
-                print_manual_control_blocked(terminal_tid);
+                int accepted = tc2_stop_physical_demo();
+                tc_puts(terminal_tid,
+                        "\r\nreturnbackstop requested; emergency-stop batch accepted for ");
+                tc_put_uint(terminal_tid, (unsigned int)accepted);
+                tc_puts(terminal_tid,
+                        accepted > 0 ?
+                        " scripted train(s); returnback UI state cleared\r\n" :
+                        " scripted train(s); stop failed, returnback UI state preserved\r\n");
 #else
-                run_stop_plan(terminal_tid, can_tid, "C8", TC_DEFAULT_TRAIN, TC_DEFAULT_SPEED);
+                tc_puts(terminal_tid, "\r\nreturnbackstop is TC2-only\r\n");
+#endif
+                return;
+        }
+
+        if (command_token(p, "returnback")) {
+#ifdef MODE_TC2
+                char first[16];
+                char second[16];
+                char third[16];
+                int now = Time();
+                int profile_id = -1;
+                p += 10;
+                if (parse_word(&p, first, sizeof(first)) < 0 ||
+                    parse_word(&p, second, sizeof(second)) < 0 ||
+                    parse_word(&p, third, sizeof(third)) < 0 ||
+                    !no_more_args(p)) {
+                        tc_puts(terminal_tid,
+                                "\r\nusage: returnback <intersection/destination> <intersection/destination> <intersection/destination> (FAKE fixed physical script; place T14@A, T15@C, T17@F)\r\n");
+                        return;
+                }
+                if (tc_streq(first, "6") &&
+                    tc_streq(second, "18") &&
+                    tc_streq(third, "15")) {
+                        profile_id = TC2_DEMO_PROFILE_INTERSECTIONS;
+                } else if (tc_streq(first, "D4") &&
+                           tc_streq(second, "D3") &&
+                           tc_streq(third, "D1")) {
+                        profile_id = TC2_DEMO_PROFILE_DESTINATIONS;
+                }
+                if (profile_id < 0) {
+                        tc_puts(terminal_tid,
+                                "\r\nreturnback rejected: unsupported fixed script arguments\r\n");
+                        return;
+                }
+                if (tc2_start_physical_demo(
+                            now < 0 ? 0u : (uint32_t)now,
+                            14, 15, 17, profile_id) < 0) {
+                        tc2_status_set(
+                                "returnback rejected: scheduler, CAN, and sensors must be healthy with no managed jobs");
+                        tc_puts(terminal_tid,
+                                "\r\nreturnback rejected: place T14@A, T15@C, T17@F; scheduler/CAN/sensors must be healthy and trips must be empty\r\n");
+                } else {
+                        if (profile_id ==
+                            TC2_DEMO_PROFILE_DESTINATIONS) {
+                                tc_puts(terminal_tid,
+                                        "\r\nreturnback FAKE demo started: T14 A->d4->A, T15 C->d3->C, T17 F->d1->F; speed=80; use returnbackstop to brake and clear UI\r\n");
+                        } else {
+                                tc_puts(terminal_tid,
+                                        "\r\nreturnback FAKE demo started: T14@A -> junction 6 script, T15@C -> junction 18 script, T17@F -> junction 15 script; speed=60; use returnbackstop to brake and clear UI\r\n");
+                        }
+                }
+#else
+                tc_puts(terminal_tid, "\r\nreturnback is TC2-only\r\n");
 #endif
                 return;
         }
@@ -3347,6 +5228,8 @@ static void tc2_execute_live_dashboard_command(
                 command_only(command, "q");
         int preserve_text_output =
                 command_only(command, "help") ||
+                command_token(command, "returnback") ||
+                command_only(command, "returnbackstop") ||
                 command_only(command, "cal") ||
                 command_only(command, "targets") ||
                 command_only(command, "status") ||
@@ -3462,6 +5345,7 @@ void TrainControlTask(void) {
                 tc2_ui_shutdown_requested = 0;
                 tc2_ui_shutdown_frame_queued = 0;
                 tc2_ui_next_render_tick = 0;
+                tc2_demo_reset_state();
                 tc2_status_set(
                         tc2_offline_controller_ready ?
                         "offline simulator ready; stage A-F to d1-d8 trips" :
@@ -3488,7 +5372,7 @@ void TrainControlTask(void) {
                 "commands use simdispatch/simgo.\r\n> ");
 #else
         tc_puts(terminal_tid,
-                "\r\nType `help` for commands, or `demo` to run the default route/stop plan.\r\n> ");
+                "\r\nType `help` for commands.\r\n> ");
 #endif
 
 #ifdef MODE_TC2
@@ -3501,13 +5385,16 @@ void TrainControlTask(void) {
 
                 if (tc2_offline_controller_ready) {
                         step_status = Tc2OfflineControllerStep(
-                                &tc2_offline_controller_state, now_tick);
+                                &tc2_offline_controller_state,
+                                now_tick);
                         if (step_status < 0) {
                                 tc2_status_set(
                                         "offline controller failed closed; use simreset");
                         }
                 }
+                tc2_step_physical_demo(now_tick);
                 if (tc2_ui_active && tc2_ui_live &&
+                    !tc2_demo_state.active &&
                     tc2_sync_live_ui(now_tick) < 0) {
                         tc2_status_set(
                                 "live UI snapshot unavailable; dispatcher safety remains active");
@@ -3534,7 +5421,7 @@ void TrainControlTask(void) {
                                                                     command,
                                                                     "help")) {
                                                                 tc2_status_set(
-                                                                        "UI mode: simdispatch/simgo/simtrips/simremove/simreset/uioff");
+                                                                        "UI mode: returnback/simdispatch/simgo/simtrips/simremove/simreset/uioff");
                                                         } else {
                                                                 tc2_status_set(
                                                                         "live command rejected while UI is active; use uioff first");

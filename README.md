@@ -1,5 +1,10 @@
 # CS452 Train Control Part 2
 
+> Branch note: `remote-physical-demo` preserves a later remote three-train
+> demonstration variant. The stable `main` branch remains the primary portfolio
+> version. This variant builds on the same kernel, but its older host-side
+> `tc2_command_ui_test` expectations do not yet match the new demo command.
+
 This repository contains the TC2 multi-train controller for the CS452 Track D
 layout.  The TC1 calibration commands remain available in an explicit TC1
 build, while the default build is TC2.

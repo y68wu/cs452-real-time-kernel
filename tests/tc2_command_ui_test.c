@@ -1395,6 +1395,40 @@ int CanTrainSetSpeed(int tid, int train, int speed) {
         return 0;
 }
 
+int CanTrainSetSpeedPriority(int tid, int train, int speed) {
+        return CanTrainSetSpeed(tid, train, speed);
+}
+
+int CanTrainReversePriority(int tid, int train) {
+        (void)tid;
+        (void)train;
+        return 0;
+}
+
+int CanTrainEmergencyStopBatch(int tid, const int *trains, int count) {
+        (void)tid;
+        (void)trains;
+        (void)count;
+        return 1;
+}
+
+int CanGetBatchStatus(int tid, unsigned int token,
+                      can_batch_status_t *status) {
+        (void)tid;
+        (void)token;
+        if (status) memset(status, 0, sizeof(*status));
+        return 0;
+}
+
+int Tc2DispatchDemoSwitchBatch(int tid, const int *switches,
+                               const char *directions, int count) {
+        (void)tid;
+        (void)switches;
+        (void)directions;
+        (void)count;
+        return 0;
+}
+
 int CanSwitch(int tid, int switch_number, char direction) {
         (void)tid;
         (void)switch_number;

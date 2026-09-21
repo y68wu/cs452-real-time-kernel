@@ -887,9 +887,14 @@ second train cannot reserve the physical turnout while the first train or its
 tail may occupy it.  The CAN server accepts turnout batches only from the
 registered dispatcher, while an unexpected physical turnout report during
 motion fails the active trip closed.  The TC2 build disables legacy `tr`,
-`sw`, `route`, `stop`, `demo`, `reserve`, and `release` commands even when the
-scheduler is idle; all movement and protection changes go through
-`dispatch`/`go`/`cancel`/`remove`.
+`sw`, `route`, `stop`, `reserve`, and `release` commands even when the
+scheduler is idle; all physical movement and protection changes go through
+`dispatch`/`go`/`cancel`/`remove`. The `demo` command is a deterministic
+physical three-train exercise: place T14 at A, T15 at C, and T17 at F. At
+speed 60, each train follows a sensor-confirmed outbound and return leg,
+showing its phase in the UI before stopping at the return endpoint. The
+three corridors and their turnout sets are physically disjoint. `demostop`
+provides an early operator stop.
 
 ## Sensor attribution and one-error behavior
 
