@@ -1,0 +1,237 @@
+# CS452/652 Train Control Part 2 README
+
+## Student Information
+
+Name: Yutong Wu / Chris Wu  
+WatIAM: y68wu  
+Student ID: REDACTED  
+
+Repository: https://git.uwaterloo.ca/y68wu/cs452_kernel.git  
+Branch: tc2  
+
+## Build Instructions
+
+This program should be built on the linux.student.cs environment.
+
+From a fresh clone:
+
+    git clone https://git.uwaterloo.ca/y68wu/cs452_kernel.git
+    cd cs452_kernel
+    git checkout tc2
+    make clean
+    make MODE=TC2
+
+The generated image is:
+
+    iotest.img
+
+To upload the image to Track D:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img d8:3a:dd:1b:36:9e
+
+To open the serial terminal:
+
+    gtkterm -p /dev/ttyS0 -s 115200
+
+## Basic Commands
+
+Stop both trains before each demo:
+
+    tr 14 0
+    tr 13 0
+
+Show tracked TC2 train states and current destinations:
+
+    trains
+
+Give a train a destination:
+
+    tc2dest <train> <destination> <speed>
+
+Example:
+
+    tc2dest 14 D10 120
+
+Supported calibrated destinations:
+
+    A5
+    B7
+    C8
+    D10
+    LOOP
+
+Sensor attribution test:
+
+    tc2sensor <sensor>
+
+Examples:
+
+    tc2sensor A5
+    tc2sensor BAD
+
+Expected sensor reports are attributed to the active train when possible. Unexpected reports are treated as spurious.
+
+## TC2 Demo Commands
+
+The following four demo commands were calibrated and tested on Track D using trains 13 and 14.
+
+### Demo 1: B7 / LOOP catch-up hold
+
+Command:
+
+    tc2b7loop
+
+Equivalent tuning command:
+
+    tc2b7loopx 4 2 30 46 17
+
+Scenario:
+
+Train 14 goes to B7. Train 13 goes to LOOP. Train 13 starts behind train 14 and catches up near the shared section around switch 8. Train 13 waits until train 14 clears the shared section. Then switch 8 is released to the LOOP route and train 13 continues to LOOP.
+
+This demonstrates simultaneous train movement, shared-route reservation, waiting, route handoff, and collision avoidance.
+
+### Demo 2: B7 / D10 crossing wait
+
+Command:
+
+    tc2b7d10
+
+Equivalent tuning command:
+
+    tc2b7d10x 4 54 56 76 40
+
+Scenario:
+
+Train 14 goes to B7. Train 13 goes to D10. Train 13 moves to a safe hold point between switch 8 and switch 17. Train 13 waits while train 14 finishes its route to B7. After train 14 reaches B7, the downstream route is released for D10 and train 13 continues to D10.
+
+This demonstrates simultaneous train movement, a mid-route hold point, time-domain collision avoidance, and safe turnout release.
+
+### Demo 3: D10 / A5 no-wait case
+
+Command:
+
+    tc2d10a5
+
+Equivalent tuning command:
+
+    tc2d10a5x 4 20 17
+
+Scenario:
+
+Train 14 goes to D10. Train 13 goes to A5. Both trains run at speed 120. The calibrated timing is safe, so no waiting is needed. Train 13 stops at A5 and train 14 stops at D10.
+
+This demonstrates that the controller does not unnecessarily stop trains when the route timing is safe.
+
+### Demo 4: Collision avoidance stop
+
+Command:
+
+    tc2collision
+
+Scenario:
+
+Train 14 is assigned toward D10 and runs at speed 120. Train 13 is assigned toward A5 and runs at speed 100. The calibrated collision profile uses gap 4, train 14 total ticks 28, and train 13 total ticks 24. This timing profile is treated as a shared-track collision risk. The controller prevents the unsafe continuation by stopping both trains safely.
+
+This demonstrates that two trains attempting to use an unsafe shared-track timing are prevented from continuing.
+
+## Route Model
+
+The implementation uses calibrated named routes. Each named destination has a route consisting of turnout settings. The controller applies the turnout settings, runs the train for a calibrated number of ticks, and then stops the train with speed 0.
+
+The route table uses physical track diagram switch labels. The CAN switch layer maps those physical labels to the observed CAN accessory address internally.
+
+Calibrated route settings:
+
+    A5 route:    8 S
+    B7 route:    8 S, 17 S, 155 S
+    C8 route:    8 S, 17 S, 156 S, 15 S
+    D10 route:   8 S, 17 S, 156 S
+    LOOP internally.
+
+Calibrated route settings:
+
+    A5 route:    8 S
+    B7 route:    8 S, 17 S, 155 S
+    C route:  8 C, 7 S, 18 C, 3 S, 2 C, 1 C
+
+Calibrated speed-120 stopping data from TC1:
+
+    A5:   19 ticks
+    B7:   28 ticks
+    C8:   37 ticks
+    D10:  28 ticks
+    LOOP: 32 ticks
+
+Additional TC2 demo calibration data:
+
+    tc2b7loopx:  4 2 30 46 17
+    tc2b7d10x:   4 54 56 76 40
+    tc2d10a5x:   4 20 17
+    tc2collision: gap 4, train 14 speed 120 ticks 28, train 13 speed 100 ticks 24
+
+## Collision Avoidance Policy
+
+The implementation uses a conservative reservation policy over calibrated route sections and important turnouts.
+
+The policy is:
+
+1. A train reserves the track sections and turnouts needed for its route.
+2. If another train needs a conflicting section, the second train is delayed or held at a safe point.
+3. Turnouts are not switched while a train is assumed to be passing the turnout.
+4. Once the first train clears the shared section, the second train is released.
+5. If the controller detects an unsafe timing profile, both trains are stopped.
+
+This policy is conservative. It prioritizes safe and repeatable multi-train movement over maximum throughput.
+
+## Sensor Attribution and Robustness
+
+The TC2 interface includes a sensor attribution command:
+
+    tc2sensor <sensor>
+
+Expected sensor reports are associated with the train whose current destination or route matches the report. Unexpected sensor reports are printed as spurious or ignored.
+
+For example:
+
+    tc2sensor BAD
+
+is used to show that a single bad sensor report does not break the train-control state.
+
+## Implementation Notes
+
+The main TC2 train-control logic is implemented in:
+
+    train_control.c
+
+TC2 mode startup is enabled in:
+
+    main.c
+    tasks.c
+
+The implementation includes:
+
+- TC2 command parsing
+- current destination display
+- user destination assignment through tc2dest
+- calibrated route application
+- conservative reservation masks
+- multi-train scheduling for calibrated demos
+- sensor attribution output
+- collision-risk detection and safe stopping
+
+The train-control code runs on top of the existing kernel tasks, including the terminal server, CAN server, clock server, name server, and train-control task.
+
+No generated build artifacts are required in the repository.
+
+## Cleaning
+
+To remove generated files:
+
+    make clean
+
+Before submission, the repository should be clean:
+
+    git status --short
+
+This should produce no output.

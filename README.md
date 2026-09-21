@@ -5,7 +5,9 @@ These are archived source snapshots of my University of Waterloo CS452 train-con
 | Directory | Stage |
 | --- | --- |
 | `cs452/` | Initial A0 hardware and train-control work |
+| `cs452-backup-before-a0-restart/` | A0 restart backup with measurements and modular code |
 | `cs452_kernel/` | Kernel 1–4 and early TC1 work |
+| `cs452-kernel-tc2-branch/` | Early TC2 branch from the kernel repository |
 | `cs452_kernel2/` | Later kernel milestone snapshot |
 | `cs452_kernel3/` | Later kernel milestone snapshot |
 

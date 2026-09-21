@@ -1,0 +1,122 @@
+# CS452 Kernel Part 1
+
+## Author
+
+Chris Wu  
+User ID: y68wu  
+Student ID: REDACTED  
+
+## Repository
+
+https://git.uwaterloo.ca/y68wu/cs452_kernel.git
+
+## Build Instructions
+
+Build in the linux.student.cs environment from the repository root:
+
+    make clean
+    make
+
+A successful build produces:
+
+    iotest.elf
+    iotest.img
+
+The Raspberry Pi image to upload is:
+
+    iotest.img
+
+## Upload and Run Instructions
+
+Upload to Track C:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img trackc
+
+Upload to Track D:
+
+    /u/cs452/public/tools/upload.sh ./iotest.img trackd
+
+After uploading, reset the corresponding Raspberry Pi and observe the serial output in gtkterm.
+
+## Expected Output
+
+The program should print output similar to:
+
+    CS452 Kernel Part 1
+    Starting kernel...
+    Created: 2
+    Created: 3
+    TestTask: tid=4 parent=1
+    TestTask: tid=4 parent=1
+    Created: 4
+    TestTask: tid=5 parent=1
+    TestTask: tid=5 parent=1
+    Created: 5
+    FirstUserTask: exiting
+    TestTask: tid=2 parent=1
+    TestTask: tid=3 parent=1
+    TestTask: tid=2 parent=1
+    TestTask: tid=3 parent=1
+    Kernel: no ready tasks; halting.
+
+## Implemented Kernel Primitives
+
+    Create(int priority, void (*function)())
+    MyTid()
+    MyParentTid()
+    Yield()
+    Exit()
+
+## Program Structure
+
+    boot.S          Raspberry Pi boot entry
+    main.c          hardware initialization and kernel startup
+    kernel.c/h      kernel dispatcher and scheduler control
+    task.c/h        task descriptors, task stacks, ready queues
+    syscall.c/h     syscall wrapper functions
+    syscall_asm.S   SVC, exception vector, context save/restore
+    tasks.c/h       FirstUserTask and TestTask
+    uart.c/h        UART terminal I/O
+    rpi.c/h         Raspberry Pi GPIO setup
+    util.c/h        formatting helpers
+
+## Kernel Design
+
+The kernel uses a static task descriptor array and statically allocated task stacks.  
+There is no heap allocation.
+
+Each task descriptor stores:
+
+    task id
+    parent task id
+    priority
+    run state
+    saved stack pointer
+    entry function pointer
+    ready queue next pointer
+
+The scheduler uses static priority queues. Lower numeric priority means higher scheduling priority. Tasks at the same priority are scheduled FIFO / round-robin.
+
+## Known Limitations
+
+This is Kernel Part 1 only. The following are not implemented yet:
+
+    message passing
+    AwaitEvent
+    interrupt handling
+    name server
+    clock server
+    terminal server
+    train control servers
+    memory protection
+    task generation numbers for tid reuse
+
+## Generated Files
+
+Generated build files should not be committed. The repository ignores:
+
+    *.o
+    *.d
+    *.elf
+    *.img
+    *.map

@@ -1,0 +1,85 @@
+# README-A0
+
+## Assignment
+
+CS452/652 Spring 2026 - Assignment 0
+
+## Repository Structure
+
+The Assignment 0 files are located in the `a0/` directory.
+
+Important files:
+
+- `src/main.c`: main polling loop structure
+- `src/clock.c`, `src/clock.h`: clock logic based on timer polling
+- `src/command.c`, `src/command.h`: user command parsing
+- `src/display.c`, `src/display.h`: terminal display layout
+- `src/train.c`, `src/train.h`: train and switch command interface
+- `src/sensor.c`, `src/sensor.h`: recent sensor tracking interface
+- `measurements/sensor_timing.c`: timing measurement skeleton code
+- `measurements/timing_notes.md`: notes for timing test results
+- `docs/A0-report.md`: draft content for the final PDF submission
+
+## Build Instructions
+
+From the repository root:
+
+```bash
+make
+```
+
+Or from the Assignment 0 directory:
+
+```bash
+cd a0
+make
+```
+
+## Run Instructions
+
+This program is intended to run on the Raspberry Pi system used for CS452.
+
+The current source files provide the Assignment 0 code structure. The hardware-specific UART0, CAN bus, and Raspberry Pi system timer logic should be connected using the course-provided environment and starter code.
+
+## Supported Commands
+
+The command interface is designed to support:
+
+```text
+tr <train number> <train speed>
+rv <train number>
+sw <switch number> <S|C>
+q
+```
+
+## Program Structure
+
+The program is organized around a polling loop.
+
+Each loop iteration is responsible for checking:
+
+1. the system timer,
+2. terminal input through UART0,
+3. CAN bus messages from the train hardware,
+4. sensor updates,
+5. whether the terminal display needs to be refreshed.
+
+The clock should be updated using elapsed time from the Raspberry Pi system timer. It should not depend on delaying the loop.
+
+## Known Issues
+
+To be updated before final submission.
+
+## Documentation and Image
+
+The draft PDF report content is in:
+
+```text
+a0/docs/A0-report.md
+```
+
+The timing measurement notes are in:
+
+```text
+a0/measurements/timing_notes.md
+```
